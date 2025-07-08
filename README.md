@@ -61,4 +61,5 @@
 </br>
 
 ## ERD
-![](https://velog.velcdn.com/images/jiw0707/post/e8c3f118-3fb3-40f1-b22c-0cd4750c5d62/image.PNG)
+![](https://velog.velcdn.com/images/jiw0707/post/2aeff770-3dae-45ea-aac5-18619e16139c/image.png)
+
