@@ -10,6 +10,10 @@ import java.sql.*;
 @Setter
 // @Table(name = "report")
 public class Report {
+    // report_id
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long reportId;
     // 전일종가
     private String preCloseprice;
     // 시가
