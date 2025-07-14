@@ -8,6 +8,9 @@ import java.sql.*;
 @Entity
 @Getter
 @Setter
+@Builder                    // 이 어노테이션 추가
+@NoArgsConstructor         // JPA용 기본 생성자
+@AllArgsConstructor        // Builder용 전체 생성자
 // @Table(name = "account")
 public class Account {
     // 계좌번호
@@ -33,7 +36,8 @@ public class Account {
     private Timestamp accountCreatetime;
     // 데이터변경일자
     private Timestamp accountChangetime;
-    @ManyToOne
+
+//    @ManyToOne
     @JoinColumn(name = "user_id")
-    private User user;
+    private String userId;
 }
