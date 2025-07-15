@@ -1,5 +1,7 @@
 package com.project.stockpay.common.websocket.dto;
 
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import lombok.*;
 
 import java.text.NumberFormat;
@@ -10,7 +12,7 @@ import java.text.NumberFormat;
 @AllArgsConstructor
 public class RealTimeStockPriceDto {
     private String stockCode;        // 종목코드
-    private String tradeTime;        // 체결시간 (HHMMSS)
+    private LocalDateTime tradeTime;        // 체결시간 (HHMMSS)
     private Integer currentPrice;    // 현재가
     private String changeSign;       // 전일대비부호 (1:상한, 2:상승, 3:보합, 4:하한, 5:하락)
     private Integer changeAmount;    // 전일대비
@@ -20,25 +22,26 @@ public class RealTimeStockPriceDto {
     private Long timestamp;         // 수신시간
 
     // 등락 상태 반환
-    public String getPriceStatus() {
+    public enum PriceStatus {
+        UP_LIMIT, UP, FLAT, DOWN_LIMIT, DOWN, UNKNOWN
+    }
+    public PriceStatus getPriceStatus() {
         switch (changeSign) {
-            case "1": return "상한가";
-            case "2": return "상승";
-            case "3": return "보합";
-            case "4": return "하한가";
-            case "5": return "하락";
-            default: return "알수없음";
+            case "1": return PriceStatus.UP_LIMIT;
+            case "2": return PriceStatus.UP;
+            case "3": return PriceStatus.FLAT;
+            case "4": return PriceStatus.DOWN_LIMIT;
+            case "5": return PriceStatus.DOWN;
+            default: return PriceStatus.UNKNOWN;
         }
     }
 
     // 체결시간 포맷팅
     public String getFormattedTradeTime() {
-        if (tradeTime != null && tradeTime.length() == 6) {
-            return tradeTime.substring(0, 2) + ":" +
-                    tradeTime.substring(2, 4) + ":" +
-                    tradeTime.substring(4, 6);
+        if (tradeTime != null) {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm:ss");
         }
-        return tradeTime;
+        return null;
     }
 
     // 가격 포맷팅

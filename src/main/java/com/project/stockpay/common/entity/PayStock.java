@@ -21,7 +21,7 @@ public class PayStock {
     // 매도주문상태
     private String sellStatus;
     // 매도주문시간
-    private Timestamp sellDate;
+    private Timestamp sellTime;
     // 종목티커 (FK)
     @ManyToOne
     @JoinColumn(name = "stock_ticker")

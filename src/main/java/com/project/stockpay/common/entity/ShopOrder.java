@@ -13,13 +13,13 @@ public class ShopOrder {
     @Id
     private String orderId;
     // 받는사람이름
-    private String reciver;
+    private String receiver;
     // 받는주소
-    private String reciverAdd;
+    private String receiverAdd;
     // 받는사람전화번호
-    private Integer reciverPhone;
+    private Integer receiverPhone;
     // 요청사항
-    private String reciverRequire;
+    private String receiverRequire;
     // 총가격
     private Integer totalPrice;
     // 주문날짜

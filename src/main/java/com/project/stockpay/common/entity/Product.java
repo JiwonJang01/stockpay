@@ -12,11 +12,11 @@ public class Product {
     @Id
     private String productId;
     // 상품이름
-    private String productName;
+    private String name;
     // 상품가격
-    private Integer productPrice;
+    private Integer price;
     // 상품종류
-    private String productCategory;
+    private String category;
     // 상품설명
-    private String productDec;
+    private String description;
 }

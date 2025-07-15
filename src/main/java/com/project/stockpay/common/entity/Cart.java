@@ -6,8 +6,8 @@ import lombok.*;
 @Entity
 @Getter
 @Setter
-// @Table(name = "bag")
-public class Bag {
+// @Table(name = "cart")
+public class Cart {
     // 장바구니 id
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -23,7 +23,7 @@ public class Bag {
     @JoinColumn(name = "product_id")
     private Product product;
     // 고객아이디 (FK)
-    @ManyToOne
+    @OneToOne
     @JoinColumn(name = "user_id")
     private User user;
 }

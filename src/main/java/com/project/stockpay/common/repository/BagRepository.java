@@ -1,14 +1,14 @@
 package com.project.stockpay.common.repository;
 
-import com.project.stockpay.common.entity.Bag;
+import com.project.stockpay.common.entity.Cart;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 import java.util.List;
 
 @Repository
-public interface BagRepository extends JpaRepository<Bag, String> {
+public interface BagRepository extends JpaRepository<Cart, String> {
     // 사용자별 장바구니 조회
-    List<Bag> findByUser_UserId(String userId);
+    List<Cart> findByUser_UserId(String userId);
     // 상품별 장바구니 조회
-    List<Bag> findByProduct_ProductId(String productId);
+    List<Cart> findByProduct_ProductId(String productId);
 }
