@@ -2,6 +2,7 @@ package com.project.stockpay.common.account.service;
 
 import com.project.stockpay.common.account.dto.AccountSummaryDto;
 import com.project.stockpay.common.entity.*;
+import com.project.stockpay.common.entity.Account.AccountStatus;
 import com.project.stockpay.common.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -67,19 +68,18 @@ public class AccountService {
     Account account = Account.builder()
         .accountNum(accountNum)
         .userId(userId)  // userId 직접 설정
-        .accountStatus("ACTIVE")
-        .accountType("INVESTMENT")
+        .accountStatus(AccountStatus.ACTIVE)
         .accountName("모의투자계좌")
-        .accountPw(1234)
+        .accountPw("1234")
         .accountOpendate(Date.valueOf(LocalDate.now()))
-        .accountMoney(INITIAL_BALANCE)
-        .accountWithdrawal(INITIAL_BALANCE)
+        .accountAmount(INITIAL_BALANCE)
+        .accountWithdrawalAmount(INITIAL_BALANCE)
         .accountCreatetime(Timestamp.valueOf(LocalDateTime.now()))
         .build();
 
     Account savedAccount = accountRepository.save(account);
     log.info("계좌 생성 완료: accountNum={}, balance={}",
-        savedAccount.getAccountNum(), savedAccount.getAccountMoney());
+        savedAccount.getAccountNum(), savedAccount.getAccountAmount());
 
     return savedAccount;
   }
@@ -90,7 +90,7 @@ public class AccountService {
   @Transactional(readOnly = true)
   public Integer getBalance(String userId) {
     Account account = getAccountByUserId(userId);
-    return account.getAccountMoney();
+    return account.getAccountAmount();
   }
 
   /**
@@ -112,7 +112,7 @@ public class AccountService {
     log.info("잔고 업데이트: userId={}, amount={}", userId, amount);
 
     Account account = getAccountByUserId(userId);
-    Integer currentBalance = account.getAccountMoney();
+    Integer currentBalance = account.getAccountAmount();
     Integer newBalance = currentBalance + amount;
 
     if (newBalance < 0) {
@@ -120,8 +120,8 @@ public class AccountService {
     }
 
     // 여기도 빌더로 바꿀 수 있지 않을까?
-    account.setAccountMoney(newBalance);
-    account.setAccountWithdrawal(newBalance); // 출금가능금액도 동일하게 설정
+    account.setAccountAmount(newBalance);
+    account.setAccountWithdrawalAmount(newBalance); // 출금가능금액도 동일하게 설정
     account.setAccountChangetime(Timestamp.valueOf(LocalDateTime.now()));
     accountRepository.save(account);
 
@@ -186,7 +186,7 @@ public class AccountService {
     AccountSummaryDto summary = new AccountSummaryDto();
     summary.setAccountNum(account.getAccountNum());
     summary.setUserId(userId);
-    summary.setBalance(new BigDecimal(account.getAccountMoney()));
+    summary.setBalance(new BigDecimal(account.getAccountAmount()));
     summary.setCreatedAt(account.getAccountCreatetime().toLocalDateTime());
 
     return summary;
