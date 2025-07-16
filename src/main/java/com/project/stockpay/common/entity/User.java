@@ -8,6 +8,7 @@ import java.sql.*;
 @Entity
 @Getter
 @Setter
+@Builder
 // @Table(name = "user")
 public class User {
     // 고객 아이디 user_id
