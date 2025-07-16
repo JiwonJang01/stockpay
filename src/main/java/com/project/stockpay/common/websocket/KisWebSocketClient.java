@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.project.stockpay.common.websocket.dto.RealTimeOrderbookDto;
 import com.project.stockpay.common.websocket.dto.RealTimeStockPriceDto;
 import jakarta.annotation.PostConstruct;
+import java.time.LocalDateTime;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -351,7 +352,7 @@ public class KisWebSocketClient {
                 // 실시간 주가 데이터 DTO 생성
                 RealTimeStockPriceDto priceData = RealTimeStockPriceDto.builder()
                         .stockCode(stockCode)
-                        .tradeTime(tradeTime)
+                        .tradeTime(LocalDateTime.parse(tradeTime))
                         .currentPrice(Integer.parseInt(currentPrice))
                         .changeSign(changeSign)
                         .changeAmount(Integer.parseInt(changeAmount))
