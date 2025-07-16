@@ -1,4 +1,4 @@
-package com.project.stockpay.websocket;
+package com.project.stockpay.common.websocket.controller;
 
 import com.project.stockpay.common.websocket.KisWebSocketClient;
 import com.project.stockpay.common.websocket.dto.RealTimeOrderbookDto;
