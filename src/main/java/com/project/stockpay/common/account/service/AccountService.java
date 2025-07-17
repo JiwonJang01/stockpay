@@ -48,7 +48,7 @@ public class AccountService {
 //        User user = userRepository.findById(userId)
 //                .orElseGet(() -> createTempUser(userId));
 
-    // 계좌번호 생성 (현재시간 기반)
+    // 계좌번호 생성 - 현재시간 기반
     String accountNum = generateAccountNumber();
 
     // 계좌 생성
@@ -119,7 +119,6 @@ public class AccountService {
       throw new RuntimeException("잔고 부족: 현재잔고=" + currentBalance + ", 요청금액=" + amount);
     }
 
-    // 여기도 빌더로 바꿀 수 있지 않을까?
     account.setAccountAmount(newBalance);
     account.setAccountWithdrawalAmount(newBalance); // 출금가능금액도 동일하게 설정
     account.setAccountChangetime(Timestamp.valueOf(LocalDateTime.now()));
@@ -167,11 +166,18 @@ public class AccountService {
   private User createTempUser(String userId) {
     log.info("임시 사용자 생성: userId={}", userId);
 
-    User tempUser = new User();
-    tempUser.setUserId(userId);
-    tempUser.setUserPw("temp123");
-    tempUser.setUserName("임시사용자_" + userId);
-    tempUser.setDataCreateTime(Timestamp.valueOf(LocalDateTime.now()));
+//    User tempUser = new User();
+//    tempUser.setUserId(userId);
+//    tempUser.setUserPw("temp123");
+//    tempUser.setUserName("임시사용자" + userId);
+//    tempUser.setDataCreateTime(Timestamp.valueOf(LocalDateTime.now()));
+
+    User tempUser = User.builder()
+        .userId(userId)
+        .userPw("temp123")
+        .userName("임시사용자" + userId)
+        .dataCreateTime(Timestamp.valueOf(LocalDateTime.now()))
+        .build();
 
     return userRepository.save(tempUser);
   }
@@ -183,12 +189,18 @@ public class AccountService {
   public AccountSummaryDto getAccountSummary(String userId) {
     Account account = getAccountByUserId(userId);
 
-    AccountSummaryDto summary = new AccountSummaryDto();
-    summary.setAccountNum(account.getAccountNum());
-    summary.setUserId(userId);
-    summary.setBalance(new BigDecimal(account.getAccountAmount()));
-    summary.setCreatedAt(account.getAccountCreatetime().toLocalDateTime());
+//    AccountSummaryDto summary = new AccountSummaryDto();
+//    summary.setAccountNum(account.getAccountNum());
+//    summary.setUserId(userId);
+//    summary.setBalance(new BigDecimal(account.getAccountAmount()));
+//    summary.setCreatedAt(account.getAccountCreatetime().toLocalDateTime());
 
+    AccountSummaryDto summary = AccountSummaryDto.builder()
+        .accountNum(account.getAccountNum())
+        .userId(userId)
+        .balance(new BigDecimal(account.getAccountAmount()))
+        .createdAt(account.getAccountCreatetime().toLocalDateTime())
+        .build();
     return summary;
   }
 
