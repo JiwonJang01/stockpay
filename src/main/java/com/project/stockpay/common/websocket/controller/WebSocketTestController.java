@@ -1,6 +1,7 @@
 package com.project.stockpay.common.websocket.controller;
 
 import com.project.stockpay.common.websocket.KisWebSocketClient;
+import com.project.stockpay.common.websocket.dto.MessageStats;
 import com.project.stockpay.common.websocket.dto.RealTimeOrderbookDto;
 import com.project.stockpay.common.websocket.dto.RealTimeStockPriceDto;
 import lombok.*;
@@ -143,14 +144,14 @@ public class WebSocketTestController {
       Set<String> orderbookKeys = redisTemplate.keys("realtime:orderbook:*");
 
       Map<String, Object> result = new HashMap<>();
-      result.put("stock_cache_count", stockKeys != null ? stockKeys.size() : 0);
-      result.put("orderbook_cache_count", orderbookKeys != null ? orderbookKeys.size() : 0);
+      result.put("stockCacheCount", stockKeys != null ? stockKeys.size() : 0);
+      result.put("orderbookCacheCount", orderbookKeys != null ? orderbookKeys.size() : 0);
 
       // 최근 데이터 샘플
       if (stockKeys != null && !stockKeys.isEmpty()) {
         String sampleKey = stockKeys.iterator().next();
         Object sampleData = redisTemplate.opsForValue().get(sampleKey);
-        result.put("sample_stock_data", sampleData);
+        result.put("sampleStockData", sampleData);
       }
 
       result.put("timestamp", LocalDateTime.now().toString());
@@ -171,8 +172,8 @@ public class WebSocketTestController {
       String approvalKey = webSocketClient.getApprovalKey();
 
       Map<String, Object> result = new HashMap<>();
-      result.put("approval_key", approvalKey != null ? "발급됨" : "발급실패");
-      result.put("key_length", approvalKey != null ? approvalKey.length() : 0);
+      result.put("approvalKey", approvalKey != null ? "발급됨" : "발급실패");
+      result.put("keyLength", approvalKey != null ? approvalKey.length() : 0);
       result.put("timestamp", LocalDateTime.now().toString());
 
       return ResponseEntity.ok(result);
@@ -186,26 +187,49 @@ public class WebSocketTestController {
 
   // 웹소켓 메시지 통계
   @GetMapping("/message-stats")
-  public ResponseEntity<Map<String, Object>> getMessageStats() {
+  public ResponseEntity<MessageStats> getMessageStats() {
     try {
       // Redis에서 통계 데이터 조회
       String statsKey = "websocket:stats";
       Map<Object, Object> stats = redisTemplate.opsForHash().entries(statsKey);
 
-      Map<String, Object> result = new HashMap<>();
-      result.put("total_messages", stats.getOrDefault("total_messages", 0));
-      result.put("price_messages", stats.getOrDefault("price_messages", 0));
-      result.put("orderbook_messages", stats.getOrDefault("orderbook_messages", 0));
-      result.put("error_count", stats.getOrDefault("error_count", 0));
-      result.put("last_message_time", stats.getOrDefault("last_message_time", "없음"));
-      result.put("timestamp", LocalDateTime.now().toString());
+      // lastMessageTime을 LocalDateTime으로 변환 (ISO 문자열 형식)
+      LocalDateTime lastMessageTime = null;
+      Object lastMessageTimeObj = stats.get("lastMessageTime");
+
+      if (lastMessageTimeObj != null && !lastMessageTimeObj.toString().equals("없음")) {
+        try {
+          lastMessageTime = LocalDateTime.parse(lastMessageTimeObj.toString());
+        } catch (Exception e) {
+          log.warn("lastMessageTime 파싱 실패: {}", lastMessageTimeObj, e);
+        }
+      }
+
+      MessageStats result = MessageStats.builder()
+          .totalMessages(Long.parseLong(stats.getOrDefault("totalMessages", "0").toString()))
+          .priceMessages(Long.parseLong(stats.getOrDefault("priceMessages", "0").toString()))
+          .orderbookMessages(
+              Long.parseLong(stats.getOrDefault("orderbookMessages", "0").toString()))
+          .errorCount(Long.parseLong(stats.getOrDefault("errorCount", "0").toString()))
+          .lastMessageTime(lastMessageTime)
+          .timestamp(LocalDateTime.now())
+          .build();
 
       return ResponseEntity.ok(result);
 
     } catch (Exception e) {
       log.error("메시지 통계 조회 실패", e);
-      return ResponseEntity.internalServerError()
-          .body(Map.of("status", "ERROR", "message", e.getMessage()));
+
+      MessageStats errorStats = MessageStats.builder()
+          .totalMessages(0L)
+          .priceMessages(0L)
+          .orderbookMessages(0L)
+          .errorCount(1L)
+          .lastMessageTime(null)
+          .timestamp(LocalDateTime.now())
+          .build();
+
+      return ResponseEntity.internalServerError().body(errorStats);
     }
   }
 }
