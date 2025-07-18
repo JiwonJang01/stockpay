@@ -49,6 +49,8 @@ public class TradingController {
           request.getUserId(),
           request.getStockTicker(),
           request.getQuantity(),
+          // default: 장내 시간-실시간 거래가, 장외시간-전일종가
+          // 사용자 입력 시 사용자 입력 값
           request.getPrice()
       );
 
@@ -92,6 +94,8 @@ public class TradingController {
           request.getUserId(),
           request.getStockTicker(),
           request.getQuantity(),
+          // default: 장내 시간-실시간 거래가, 장외시간-전일종가
+          // 사용자 입력 시 사용자 입력 값
           request.getPrice()
       );
 
@@ -228,7 +232,7 @@ public class TradingController {
     }
   }
 
-  // ==================== 입력 검증 메서드 ====================
+  // 입력 검증 메서드
 
   /**
    * 공통 주문 요청 검증 메서드

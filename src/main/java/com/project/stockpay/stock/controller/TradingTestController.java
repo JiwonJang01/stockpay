@@ -1,4 +1,4 @@
-package com.project.stockpay.stock;
+package com.project.stockpay.stock.controller;
 
 import com.project.stockpay.stock.dto.BuyOrderRequestDto;
 import com.project.stockpay.stock.dto.SellOrderRequestDto;
