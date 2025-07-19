@@ -7,6 +7,7 @@ import com.project.stockpay.common.websocket.dto.KisWebSocketRequest;
 import com.project.stockpay.common.websocket.dto.RealTimeOrderbookDto;
 import com.project.stockpay.common.websocket.dto.RealTimeStockPriceDto;
 import jakarta.annotation.PostConstruct;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -159,7 +160,7 @@ public class KisWebSocketClient {
     try {
       String keyPrefix = "kis:approval:";
       String cachedKey = (String) redisTemplate.opsForValue().get(keyPrefix + "key");
-      String cachedExpire = (String) redisTemplate.opsForValue().get(keyPrefix + "expire");
+      String cachedExpire = (String) redisTemplate.opsForValue().get(keyPrefix + "expiry");
 
       if (cachedKey != null && cachedExpire != null) {
         approvalKey = cachedKey;
@@ -422,7 +423,11 @@ public class KisWebSocketClient {
 
   // 웹소켓 연결 상태 확인
   public boolean isConnected() {
-    return connected && webSocketSession != null && webSocketSession.isOpen();
+    return connected &&
+        webSocketSession != null &&
+        webSocketSession.isOpen() &&
+        connectionManager != null &&
+        connectionManager.isRunning();
   }
 
   // 웹소켓 핸들러
@@ -489,13 +494,18 @@ public class KisWebSocketClient {
 
         log.debug("실시간 데이터 수신: TR_ID={}, Count={}", trId, dataCount);
 
-        if ("H0STCNT0".equals(trId)) {
-          // 주식 체결가 데이터 처리
-          processStockPriceData(realData);
-        } else if ("H0STASP0".equals(trId)) {
-          // 주식 호가 데이터 처리
-          processStockOrderbookData(realData);
+        switch (trId) {
+          case "H0STCNT0":
+            processStockPriceData(realData);
+            break;
+          case "H0STASP0":
+            processStockOrderbookData(realData);
+            break;
+          default:
+            log.debug("알 수 없는 TR_ID: {}", trId);
         }
+      } else {
+        log.warn("실시간 데이터 형식이 잘못됨: {}", data);
       }
 
     } catch (Exception e) {
@@ -550,6 +560,9 @@ public class KisWebSocketClient {
         String volume = fields[13];        // 누적거래량
         String tradingValue = fields[14];  // 누적거래대금
 
+        // 시간 파싱 수정: HHMMSS 형식을 LocalDateTime으로 변환
+        LocalDateTime tradeDateTime = parseTradeTime(tradeTime);
+
         // 실시간 주가 데이터 DTO 생성
         RealTimeStockPriceDto priceData = RealTimeStockPriceDto.builder()
             .stockCode(stockCode)
@@ -581,6 +594,25 @@ public class KisWebSocketClient {
 
       updateErrorStats("주식 체결가 데이터 처리 실패: " + e.getMessage());
     }
+  }
+
+  // 시간 파싱 메서드
+  private LocalDateTime parseTradeTime(String tradeTime) {
+    try {
+      // tradeTime은 HHMMSS 형식 (예: "091205")
+      if (tradeTime.length() == 6) {
+        int hour = Integer.parseInt(tradeTime.substring(0, 2));
+        int minute = Integer.parseInt(tradeTime.substring(2, 4));
+        int second = Integer.parseInt(tradeTime.substring(4, 6));
+
+        return LocalDate.now().atTime(hour, minute, second);
+      }
+    } catch (Exception e) {
+      log.warn("시간 파싱 실패: {}", tradeTime, e);
+    }
+
+    // 파싱 실패 시 현재 시간 반환
+    return LocalDateTime.now();
   }
 
   // 주식 호가 데이터 처리
