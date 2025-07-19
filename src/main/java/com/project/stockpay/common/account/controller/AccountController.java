@@ -33,7 +33,7 @@ public class AccountController {
       result.put("status", "SUCCESS");
       result.put("message", "계좌 생성 완료");
       result.put("accountNum", account.getAccountNum());
-      result.put("balance", account.getAccountMoney());
+      result.put("balance", account.getAccountAmount());
       result.put("userId", userId);
 
       return ResponseEntity.ok(result);
