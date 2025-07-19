@@ -1,6 +1,9 @@
 package com.project.stockpay.common.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.project.stockpay.common.websocket.dto.KisApiResponse;
+import com.project.stockpay.common.websocket.dto.KisApprovalKeyResponse;
+import com.project.stockpay.common.websocket.dto.KisWebSocketRequest;
 import com.project.stockpay.common.websocket.dto.RealTimeOrderbookDto;
 import com.project.stockpay.common.websocket.dto.RealTimeStockPriceDto;
 import jakarta.annotation.PostConstruct;
@@ -12,15 +15,17 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.socket.*;
-import org.springframework.web.socket.client.WebSocketClient;
 import org.springframework.web.socket.client.WebSocketConnectionManager;
 import org.springframework.web.socket.client.standard.StandardWebSocketClient;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
-import java.net.URI;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import reactor.util.retry.Retry;
 
 @Component
 @Slf4j
@@ -43,19 +48,39 @@ public class KisWebSocketClient {
   private String webSocketUrl;
 
   private WebSocketSession webSocketSession;
+  private WebSocketConnectionManager connectionManager;
   private String approvalKey;
+  private LocalDateTime approvalKeyExpire; // 승인키 만료 시간
   private volatile boolean connected = false;
+  private final Object approvalKeyLock = new Object(); // 승인키 갱신 동기화
 
-  // 웹소켓 승인키 발급
+
+  /** 승인키 유효성 확인
+   * - 승인키는 24시간 만료
+   * - 12시간 마다 갱신
+   */
+  private boolean isApprovalKeyValid() {
+    if (approvalKey == null || approvalKeyExpire == null) {
+      return false;
+    }
+    // 만료 30분 전에 미리 갱신
+    return LocalDateTime.now().isBefore(approvalKeyExpire.minusMinutes(30));
+  }
+
+  // 웹소켓 승인키 발급/갱신
   public String getApprovalKey() {
     try {
-      if (approvalKey != null) {
+      // 기존 승인키가 유효하면 재사용
+      if (isApprovalKeyValid()) {
+        log.debug("기존 승인키 재사용 (만료시간: {})", approvalKeyExpire);
         return approvalKey;
       }
 
+      log.info("승인키 발급/갱신 시작...");
+
       // 실전: https://openapi.koreainvestment.com:9443
       // 모의: https://openapivts.koreainvestment.com:29443
-      String url = "https://openapivts.koreainvestment.com:29443/oauth2/Approval"; // 모의투자용
+      String url = "https://openapivts.koreainvestment.com:29443/oauth2/Approval";
 
       Map<String, String> requestBody = Map.of(
           "grant_type", "client_credentials",
@@ -63,68 +88,267 @@ public class KisWebSocketClient {
           "secretkey", appSecret
       );
 
-      @SuppressWarnings("unchecked")
-      Map<String, Object> response = webClient.post()
+        // 이펙티브 자바 - 제네릭
+//      @SuppressWarnings("unchecked")
+//      Map<String, Object> response = webClient.post()
+//          .uri(url)
+//          .header("Content-Type", "application/json")
+//          .bodyValue(requestBody)
+//          .retrieve()
+//          .bodyToMono(Map.class)
+//          .block();
+
+      KisApprovalKeyResponse response = webClient.post()
           .uri(url)
           .header("Content-Type", "application/json")
           .bodyValue(requestBody)
           .retrieve()
-          .bodyToMono(Map.class)
-          .block();
+          .bodyToMono(KisApprovalKeyResponse.class)
+          .retryWhen(Retry.fixedDelay(3, Duration.ofSeconds(2))
+              .doBeforeRetry(retrySignal ->
+                  log.warn("승인키 발급 재시도 중... ({}회차)", retrySignal.totalRetries() + 1))
+              .onRetryExhaustedThrow((retryBackoffSpec, retrySignal) ->
+                  new RuntimeException("승인키 발급 재시도 횟수 초과"))
+          )
+          .block(Duration.ofSeconds(30));
 
-      if (response != null && response.containsKey("approval_key")) {
-        approvalKey = (String) response.get("approval_key");
-        log.info("웹소켓 승인키 발급 성공: {}", approvalKey);
+      if (response != null && response.isSuccess()) {
+        String oldKey = approvalKey;
+        approvalKey = response.getApprovalKey();
+        approvalKeyExpire = LocalDateTime.now().plusHours(12); // 12시간 후 만료
+
+        // Redis에 승인키와 만료시간 저장 (서버 재시작 시 복구용)
+        saveApprovalKeyToRedis();
+
+        log.info("승인키 발급/갱신 완료 (기존: {}, 신규: {}, 만료: {})",
+            oldKey != null ? oldKey.substring(0, 8) : "없음",
+            approvalKey.substring(0, 8),
+            approvalKeyExpire);
+        return approvalKey;
+      } else {
+        String errorMsg = response != null ? response.getErrorMessage() : "응답 없음";
+        throw new RuntimeException("승인키 발급 실패: " + errorMsg);
+      }
+
+    } catch (Exception e) {
+      log.error("승인키 발급/갱신 실패 - 기존 키로 계속 시도", e);
+
+      // 갱신 실패해도 기존 키가 있으면 일단 사용
+      if (approvalKey != null) {
+        log.warn("기존 승인키로 계속 진행 (만료 위험 있음)");
         return approvalKey;
       }
 
-    } catch (Exception e) {
-      log.error("웹소켓 승인키 발급 실패", e);
+      throw new RuntimeException("승인키 발급/갱신 실패", e);
     }
-
-    throw new RuntimeException("웹소켓 승인키 발급 실패");
   }
 
-  // 웹소켓 연결
-  @PostConstruct
-  public void connect() {
+  // Redis에 승인키 저장
+  private void saveApprovalKeyToRedis() {
     try {
-      log.info("한국투자증권 웹소켓 연결 시작...");
+      String keyPrefix = "kis:approval:";
+      redisTemplate.opsForValue().set(keyPrefix + "key", approvalKey, Duration.ofHours(12));
+      redisTemplate.opsForValue().set(keyPrefix + "expiry", approvalKeyExpire.toString(), Duration.ofHours(12));
+    } catch (Exception e) {
+      log.warn("승인키 Redis 저장 실패", e);
+    }
+  }
 
-      // 승인키 발급
+  // Redis에서 승인키 복구
+  private void loadApprovalKeyFromRedis() {
+    try {
+      String keyPrefix = "kis:approval:";
+      String cachedKey = (String) redisTemplate.opsForValue().get(keyPrefix + "key");
+      String cachedExpire = (String) redisTemplate.opsForValue().get(keyPrefix + "expire");
+
+      if (cachedKey != null && cachedExpire != null) {
+        approvalKey = cachedKey;
+        approvalKeyExpire = LocalDateTime.parse(cachedExpire);
+
+        if (isApprovalKeyValid()) {
+          log.info("Redis에서 승인키 복구 성공 (만료시간: {})", approvalKeyExpire);
+        } else {
+          log.info("Redis의 승인키가 만료됨 - 새로 발급 필요");
+          approvalKey = null;
+          approvalKeyExpire = null;
+        }
+      }
+    } catch (Exception e) {
+      log.warn("승인키 Redis 복구 실패", e);
+    }
+  }
+
+  // 승인키 자동 갱신 스케줄러
+  private void startApprovalKeyScheduler() {
+    ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+      Thread t = new Thread(r, "ApprovalKeyScheduler");
+      t.setDaemon(true);
+      return t;
+    });
+
+    // 1시간마다 승인키 유효성 확인 및 갱신
+    scheduler.scheduleAtFixedRate(() -> {
+      try {
+        if (!isApprovalKeyValid()) {
+          log.info("승인키 자동 갱신 시작...");
+          String newKey = getApprovalKey();
+          if (newKey != null) {
+            log.info("승인키 자동 갱신 완료");
+          }
+        } else {
+          long remainingHours = Duration.between(LocalDateTime.now(), approvalKeyExpire).toHours();
+          log.debug("승인키 유효 ({}시간 남음)", remainingHours);
+        }
+        // 웹소켓 연결 상태도 함께 확인
+        if (!isConnected()) {
+          log.warn("웹소켓 연결 끊어짐 감지 - 재연결 시도");
+          connectWebSocket();
+        }
+
+      } catch (Exception e) {
+        log.error("승인키/연결 상태 확인 실패", e);
+      }
+    }, 0, 1, TimeUnit.HOURS);
+
+    log.info("승인키 자동 갱신 스케줄러 시작 (1시간 간격)");
+  }
+
+  // 애플리케이션 시작 시 실행
+  @PostConstruct
+  public void initialize() {
+    log.info("주식 실시간 데이터 서비스 시작...");
+
+    // 1. Redis에서 기존 승인키 복구 시도
+    loadApprovalKeyFromRedis();
+
+    // 2. 승인키 자동 갱신 스케줄러 시작
+    startApprovalKeyScheduler();
+
+    // 3. 웹소켓 연결 및 주요 종목 구독 시작
+    connectAndStartStreaming();
+  }
+
+  private void connectAndStartStreaming() {
+    try {
+      // 승인키 확보
       String approval = getApprovalKey();
 
-      log.info("WebSocket URL: {}", webSocketUrl);  // URL 확인용 로그 추가
-
       // 웹소켓 연결
-      org.springframework.web.socket.client.WebSocketClient client = new StandardWebSocketClient();
-      WebSocketConnectionManager connectionManager = new WebSocketConnectionManager(
-          client,
-          new KisWebSocketHandler(),
-          webSocketUrl
-      );
+      connectWebSocket();
 
-      connectionManager.setAutoStartup(true);
-      connectionManager.start();
-
-      // 연결 대기
-      int maxAttempts = 30;
-      int attempts = 0;
-      while (!connected && attempts < maxAttempts) {
-        Thread.sleep(1000);
-        attempts++;
-        log.debug("웹소켓 연결 대기 중... ({}/{})", attempts, maxAttempts);
-      }
-
+      // 연결 성공 시 주요 종목 자동 구독
       if (connected) {
-        log.info("한국투자증권 웹소켓 연결 성공");
-      } else {
-        log.error("한국투자증권 웹소켓 연결 실패 (타임아웃)");
+        subscribeToPopularStocks();
+        log.info("실시간 주식 데이터 스트리밍 시작 완료");
       }
 
     } catch (Exception e) {
-      log.error("웹소켓 연결 실패", e);
+      log.error("실시간 데이터 서비스 시작 실패", e);
+      // 5초 후 재시도
+      scheduleReconnectAttempt(0);
     }
+  }
+
+  // 연결 시작 시 승인키 확인
+  private void connectWebSocket() {
+    int maxAttempts = 5;
+    int attempt = 0;
+
+    while (attempt < maxAttempts) {
+      try {
+        attempt++;
+        log.info("웹소켓 연결 시도 ({}회차)...", attempt);
+
+        // 기존 연결이 있으면 정리
+        if (connectionManager != null && connectionManager.isRunning()) {
+          connectionManager.stop();
+          Thread.sleep(1000); // 정리 대기
+        }
+
+        org.springframework.web.socket.client.WebSocketClient client = new StandardWebSocketClient();
+        connectionManager = new WebSocketConnectionManager(
+            client,
+            new KisWebSocketHandler(),
+            webSocketUrl
+        );
+
+        connectionManager.setAutoStartup(true);
+        connectionManager.start();
+
+        // 각 시도마다 10초 대기
+        if (waitForConnection(10)) {
+          log.info("웹소켓 연결 성공 ({}회차)", attempt);
+          return; // 성공하면 즉시 종료
+        }
+
+        log.warn("웹소켓 연결 실패 ({}회차)", attempt);
+
+        // 마지막 시도가 아니면 지수 백오프로 대기
+        if (attempt < maxAttempts) {
+          long delay = Math.min(16, (long) Math.pow(2, attempt)); // 2, 4, 8, 16초
+          log.info("{}초 후 재시도...", delay);
+          Thread.sleep(delay * 1000);
+        }
+
+      } catch (Exception e) {
+        log.error("웹소켓 연결 시도 실패 ({}회차): {}", attempt, e.getMessage());
+
+        if (attempt < maxAttempts) {
+          try {
+            long delay = Math.min(16, (long) Math.pow(2, attempt));
+            log.info("{}초 후 재시도...", delay);
+            Thread.sleep(delay * 1000);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            break;
+          }
+        }
+      }
+    }
+    throw new RuntimeException("웹소켓 연결 실패 - " + maxAttempts + "회 시도 모두 실패");
+  }
+
+  // 연결 대기 (실제 연결 상태 확인)
+  private boolean waitForConnection(int maxWaitSeconds) {
+    int attempts = 0;
+    while (!connected && attempts < maxWaitSeconds) {
+      try {
+        Thread.sleep(1000);
+        attempts++;
+        log.debug("웹소켓 연결 대기 중... ({}/{}초)", attempts, maxWaitSeconds);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
+    return connected;
+  }
+
+  // 재연결 스케줄링 (지수 백오프 적용)
+  private void scheduleReconnectAttempt(int attemptCount) {
+    // 지수 백오프: 2^attemptCount 초 대기 (최대 32초)
+    long delay = Math.min(32, (long) Math.pow(2, attemptCount));
+
+    log.info("{}초 후 웹소켓 재연결 시도... ({}회차)", delay, attemptCount + 1);
+
+    new Thread(() -> {
+      try {
+        Thread.sleep(delay * 1000);
+        if (attemptCount < 5) {
+          connectAndStartStreaming();
+        } else {
+          log.error("웹소켓 연결 재시도 횟수 초과");
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        log.warn("웹소켓 재연결 스케줄 중단됨");
+      } catch (Exception e) {
+        log.error("웹소켓 재연결 실패 ({}회차)", attemptCount + 1, e);
+        if (attemptCount < 5) {
+          scheduleReconnectAttempt(attemptCount + 1);
+        }
+      }
+    }).start();
   }
 
   // 실시간 주식 체결가 구독
@@ -135,22 +359,12 @@ public class KisWebSocketClient {
     }
 
     try {
-      Map<String, Object> subscribeMessage = Map.of(
-          "header", Map.of(
-              "approval_key", getApprovalKey(),
-              "custtype", "P",  // 개인
-              "tr_type", "1",   // 등록
-              "content-type", "utf-8"
-          ),
-          "body", Map.of(
-              "input", Map.of(
-                  "tr_id", "H0STCNT0",  // 주식체결 TR_ID
-                  "tr_key", stockCode   // 종목코드
-              )
-          )
+      KisWebSocketRequest request = KisWebSocketRequest.createStockPriceSubscription(
+          getApprovalKey(),
+          stockCode
       );
 
-      String message = objectMapper.writeValueAsString(subscribeMessage);
+      String message = objectMapper.writeValueAsString(request);
       webSocketSession.sendMessage(new TextMessage(message));
 
       log.info("종목 {} 실시간 체결가 구독 요청", stockCode);
@@ -168,22 +382,12 @@ public class KisWebSocketClient {
     }
 
     try {
-      Map<String, Object> subscribeMessage = Map.of(
-          "header", Map.of(
-              "approval_key", getApprovalKey(),
-              "custtype", "P",
-              "tr_type", "1",
-              "content-type", "utf-8"
-          ),
-          "body", Map.of(
-              "input", Map.of(
-                  "tr_id", "H0STASP0",  // 주식호가 TR_ID
-                  "tr_key", stockCode
-              )
-          )
+      KisWebSocketRequest request = KisWebSocketRequest.createStockOrderbookSubscription(
+          getApprovalKey(),
+          stockCode
       );
 
-      String message = objectMapper.writeValueAsString(subscribeMessage);
+      String message = objectMapper.writeValueAsString(request);
       webSocketSession.sendMessage(new TextMessage(message));
 
       log.info("종목 {} 실시간 호가 구독 요청", stockCode);
@@ -200,22 +404,13 @@ public class KisWebSocketClient {
     }
 
     try {
-      Map<String, Object> unsubscribeMessage = Map.of(
-          "header", Map.of(
-              "approval_key", getApprovalKey(),
-              "custtype", "P",
-              "tr_type", "2",  // 해제
-              "content-type", "utf-8"
-          ),
-          "body", Map.of(
-              "input", Map.of(
-                  "tr_id", trId,
-                  "tr_key", stockCode
-              )
-          )
+      KisWebSocketRequest request = KisWebSocketRequest.createUnsubscription(
+          getApprovalKey(),
+          trId,
+          stockCode
       );
 
-      String message = objectMapper.writeValueAsString(unsubscribeMessage);
+      String message = objectMapper.writeValueAsString(request);
       webSocketSession.sendMessage(new TextMessage(message));
 
       log.info("종목 {} 구독 해제 ({})", stockCode, trId);
@@ -277,7 +472,7 @@ public class KisWebSocketClient {
       webSocketSession = null;
 
       // 재연결 시도
-      scheduleReconnect();
+      scheduleReconnectAttempt(0);
     }
   }
 
@@ -311,28 +506,32 @@ public class KisWebSocketClient {
   // JSON 응답 처리
   private void handleJsonResponse(String data) {
     try {
-      Map<String, Object> response = objectMapper.readValue(data, Map.class);
-      Map<String, Object> header = (Map<String, Object>) response.get("header");
-      String trId = (String) header.get("tr_id");
+      KisApiResponse<KisApiResponse.KisResponseBody> response = objectMapper.readValue(
+          data,
+          objectMapper.getTypeFactory().constructParametricType(
+              KisApiResponse.class,
+              KisApiResponse.KisResponseBody.class
+          )
+      );
+
+      String trId = response.getHeader() != null ? response.getHeader().getTrId() : "UNKNOWN";
 
       if ("PINGPONG".equals(trId)) {
         // PING에 대한 PONG 응답
         handlePingPong(data);
       } else {
         // 일반 응답 처리
-        Map<String, Object> body = (Map<String, Object>) response.get("body");
-        String rtCd = (String) body.get("rt_cd");
-        String msg = (String) body.get("msg1");
-
-        if ("0".equals(rtCd)) {
-          log.info("API 응답 성공: TR_ID={}, MSG={}", trId, msg);
+        if (response.isSuccess()) {
+          log.info("API 응답 성공: TR_ID={}, MSG={}", trId, response.getErrorMessage());
         } else {
-          log.warn("API 응답 오류: TR_ID={}, CODE={}, MSG={}", trId, rtCd, msg);
+          log.warn("API 응답 오류: TR_ID={}, MSG={}", trId, response.getErrorMessage());
+          updateErrorStats("API 응답 오류: " + response.getErrorMessage());
         }
       }
 
     } catch (Exception e) {
       log.error("JSON 응답 파싱 실패: {}", data, e);
+      updateErrorStats("JSON 응답 파싱 실패: " + e.getMessage());
     }
   }
 
@@ -372,10 +571,15 @@ public class KisWebSocketClient {
 
         // TODO: 웹소켓으로 클라이언트에 전송
         // messagingTemplate.convertAndSend("/topic/stock/" + stockCode, priceData);
+
+        // 통계 업데이트
+        updateMessageStats("STOCK_PRICE");
       }
 
     } catch (Exception e) {
       log.error("주식 체결가 데이터 처리 실패: {}", data, e);
+
+      updateErrorStats("주식 체결가 데이터 처리 실패: " + e.getMessage());
     }
   }
 
@@ -406,10 +610,14 @@ public class KisWebSocketClient {
         redisTemplate.opsForValue().set(cacheKey, orderbookData, Duration.ofMinutes(1));
 
         log.debug("실시간 호가 업데이트: {}", stockCode);
+
+        // 통계 업데이트
+        updateMessageStats("ORDERBOOK");
       }
 
     } catch (Exception e) {
       log.error("주식 호가 데이터 처리 실패: {}", data, e);
+      updateErrorStats("주식 호가 데이터 처리 실패: " + e.getMessage());
     }
   }
 
@@ -448,20 +656,6 @@ public class KisWebSocketClient {
     }
   }
 
-  // 재연결 스케줄링
-  private void scheduleReconnect() {
-    // 5초 후 재연결 시도
-    new Thread(() -> {
-      try {
-        Thread.sleep(5000);
-        log.info("웹소켓 재연결 시도...");
-        connect();
-      } catch (Exception e) {
-        log.error("웹소켓 재연결 실패", e);
-      }
-    }).start();
-  }
-
   // 가격 배열 추출
   private Integer[] extractPrices(String[] fields, int start, int end) {
     Integer[] prices = new Integer[end - start + 1];
@@ -486,5 +680,46 @@ public class KisWebSocketClient {
       }
     }
     return volumes;
+  }
+
+  // 메시지 통계 업데이트
+  private void updateMessageStats(String messageType) {
+    try {
+      String statsKey = "websocket:stats";
+
+      // 총 메시지 수 증가
+      redisTemplate.opsForHash().increment(statsKey, "totalMessages", 1);
+
+      // 메시지 타입별 증가
+      if ("STOCK_PRICE".equals(messageType)) {
+        redisTemplate.opsForHash().increment(statsKey, "priceMessages", 1);
+      } else if ("ORDERBOOK".equals(messageType)) {
+        redisTemplate.opsForHash().increment(statsKey, "orderbookMessages", 1);
+      } else if ("ERROR".equals(messageType)) {
+        redisTemplate.opsForHash().increment(statsKey, "errorCount", 1);
+      }
+
+      // 마지막 메시지 시간 업데이트 (ISO 문자열로 저장)
+      redisTemplate.opsForHash().put(statsKey, "lastMessageTime",
+          LocalDateTime.now().toString());
+
+    } catch (Exception e) {
+      log.error("통계 업데이트 실패", e);
+    }
+  }
+
+  // 에러 통계 업데이트
+  private void updateErrorStats(String errorMessage) {
+    try {
+      String statsKey = "websocket:stats";
+      redisTemplate.opsForHash().increment(statsKey, "errorCount", 1);
+      redisTemplate.opsForHash().increment(statsKey, "totalMessages", 1);
+      redisTemplate.opsForHash().put(statsKey, "lastMessageTime",
+          LocalDateTime.now().toString());
+      redisTemplate.opsForHash().put(statsKey, "lastError", errorMessage);
+
+    } catch (Exception e) {
+      log.error("에러 통계 업데이트 실패", e);
+    }
   }
 }
