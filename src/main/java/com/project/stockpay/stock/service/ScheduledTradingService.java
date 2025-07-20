@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
@@ -21,6 +22,7 @@ public class ScheduledTradingService {
 
   private final TradingService tradingService;
   private final StockPriceService stockPriceService;
+  private final StockStatusService stockStatusService;
 
   /**
    * 개장 시 예약 주문 처리
@@ -32,7 +34,7 @@ public class ScheduledTradingService {
 
     try {
       // 시장 개장 확인
-      if (!stockPriceService.isMarketOpen()) {
+      if (!stockStatusService.isMarketOpen()) {
         log.warn("시장이 개장되지 않았습니다. 예약 주문 처리를 건너뜁니다.");
         return;
       }
@@ -99,10 +101,10 @@ public class ScheduledTradingService {
       String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
       // 시장 상태 체크
-      boolean isMarketOpen = stockPriceService.isMarketOpen();
+      boolean isMarketOpen = stockStatusService.isMarketOpen();
 
       // 실시간 데이터 통계 체크
-      var stats = stockPriceService.getRealTimeDataStats();
+      var stats = stockStatusService.getRealTimeDataStats();
 
       log.info("=== 시스템 상태 체크 ({}) ===", currentTime);
       log.info("시장 상태: {}", isMarketOpen ? "개장" : "휴장");
@@ -138,7 +140,7 @@ public class ScheduledTradingService {
 
       for (String stockTicker : popularStocks) {
         try {
-          stockPriceService.subscribeStock(stockTicker);
+          stockStatusService.subscribeStock(stockTicker);
           Thread.sleep(100); // 0.1초 간격
         } catch (Exception e) {
           log.error("종목 구독 갱신 실패: {}", stockTicker, e);

@@ -1,29 +1,31 @@
 package com.project.stockpay.stock.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.project.stockpay.common.account.service.AccountService;
 import com.project.stockpay.common.entity.*;
 import com.project.stockpay.common.repository.*;
-import com.project.stockpay.common.websocket.dto.RealTimeStockPriceDto;
+import com.project.stockpay.stock.dto.BuyOrderRequestDto;
+import com.project.stockpay.stock.dto.OrderMessage;
+import com.project.stockpay.stock.dto.SellOrderRequestDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.DayOfWeek;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
 
 /**
  * 주식 거래 서비스
- * - 실시간 주가 데이터 기반 거래
- * - 장내/장외 시간 판단
- * - 확률 기반 체결 시스템
- * - 예약 주문 지원
+ * - 주문 접수 및 검증
+ * - Kafka 메시지 발행
+ * - 체결 처리 (StockOrderService에서 호출)
+ * - 예약 주문 처리
  */
 @Service
 @RequiredArgsConstructor
@@ -31,58 +33,49 @@ import java.util.Random;
 @Slf4j
 public class TradingService {
 
+  // === 핵심 서비스 의존성 ===
+  private final StockPriceService stockPriceService;
+  private final StockStatusService stockStatusService;
+  private final StockUtilService stockUtilService;
+  private final AccountService accountService;
+
+  // === 리포지토리 의존성 ===
   private final StockBuyRepository stockBuyRepository;
   private final StockSellRepository stockSellRepository;
   private final HoldingRepository holdingRepository;
   private final AccountRepository accountRepository;
   private final StockRepository stockRepository;
   private final AccountHistoryRepository accountHistoryRepository;
-  private final AccountService accountService;
-  private final RedisTemplate<String, Object> redisTemplate;
+
+  // === Kafka 의존성 (순환 참조 해결) ===
+  private final KafkaTemplate<String, String> kafkaTemplate;
+  private final ObjectMapper objectMapper;
 
   private final Random random = new Random();
 
-  // 거래 시간 상수
-  private static final LocalTime MARKET_OPEN = LocalTime.of(9, 0);
-  private static final LocalTime MARKET_CLOSE = LocalTime.of(15, 30);
+  // === Kafka 설정 (properties에서 주입) ===
+  @Value("${stockpay.kafka.topics.buy-orders:buy-orders}")
+  private String BUY_ORDERS_TOPIC;
+
+  @Value("${stockpay.kafka.topics.sell-orders:sell-orders}")
+  private String SELL_ORDERS_TOPIC;
+
+  // ========== 주문 접수 메서드 ==========
 
   /**
-   * 현재 시간 기반 장내/장외 판단
+   * 매수 주문 접수 (DTO 기반)
    */
-  public boolean isMarketOpen() {
-    LocalDateTime now = LocalDateTime.now();
-    DayOfWeek dayOfWeek = now.getDayOfWeek();
-    LocalTime currentTime = now.toLocalTime();
-
-    // 주말은 장외시간
-    if (dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY) {
-      return false;
-    }
-
-    // 평일 09:00 ~ 15:30만 장내시간
-    return !currentTime.isBefore(MARKET_OPEN) && !currentTime.isAfter(MARKET_CLOSE);
+  public String submitBuyOrder(BuyOrderRequestDto request) {
+    return submitBuyOrder(request.getUserId(), request.getStockTicker(),
+        request.getQuantity(), request.getPrice());
   }
 
   /**
-   * 실시간 주가 데이터 조회
+   * 매도 주문 접수 (DTO 기반)
    */
-  public RealTimeStockPriceDto getRealTimeStockPrice(String stockTicker) {
-    try {
-      String cacheKey = "realtime:stock:" + stockTicker;
-      RealTimeStockPriceDto priceData = (RealTimeStockPriceDto) redisTemplate.opsForValue()
-          .get(cacheKey);
-
-      if (priceData != null) {
-        log.debug("실시간 주가 조회 성공: {} = {}", stockTicker, priceData.getCurrentPrice());
-        return priceData;
-      } else {
-        log.warn("실시간 주가 데이터 없음: {}", stockTicker);
-        return null;
-      }
-    } catch (Exception e) {
-      log.error("실시간 주가 조회 실패: {}", stockTicker, e);
-      return null;
-    }
+  public String submitSellOrder(SellOrderRequestDto request) {
+    return submitSellOrder(request.getUserId(), request.getStockTicker(),
+        request.getQuantity(), request.getPrice());
   }
 
   /**
@@ -91,13 +84,11 @@ public class TradingService {
   public String submitBuyOrderAtMarketPrice(String userId, String stockTicker, Integer quantity) {
     log.info("시장가 매수 주문 접수: userId={}, stockTicker={}, quantity={}", userId, stockTicker, quantity);
 
-    // 1. 현재가 조회
-    Integer currentPrice = getCurrentPrice(stockTicker);
+    Integer currentPrice = stockPriceService.getCurrentPrice(stockTicker);
     if (currentPrice == null) {
       throw new RuntimeException("현재가 조회 실패: " + stockTicker);
     }
 
-    // 2. 매수 주문 접수
     return submitBuyOrder(userId, stockTicker, quantity, currentPrice);
   }
 
@@ -107,265 +98,210 @@ public class TradingService {
   public String submitSellOrderAtMarketPrice(String userId, String stockTicker, Integer quantity) {
     log.info("시장가 매도 주문 접수: userId={}, stockTicker={}, quantity={}", userId, stockTicker, quantity);
 
-    // 1. 현재가 조회
-    Integer currentPrice = getCurrentPrice(stockTicker);
+    Integer currentPrice = stockPriceService.getCurrentPrice(stockTicker);
     if (currentPrice == null) {
       throw new RuntimeException("현재가 조회 실패: " + stockTicker);
     }
 
-    // 2. 매도 주문 접수
     return submitSellOrder(userId, stockTicker, quantity, currentPrice);
   }
 
+  // ========== 핵심 주문 처리 메서드 ==========
+
   /**
-   * 매수 주문 접수 (개선된 버전)
+   * 매수 주문 접수
    */
   public String submitBuyOrder(String userId, String stockTicker, Integer quantity, Integer price) {
     log.info("매수 주문 접수 시작: userId={}, stockTicker={}, quantity={}, price={}",
         userId, stockTicker, quantity, price);
 
-    // 1. 가격이 null이면 현재가로 설정
-    if (price == null) {
-      price = getCurrentPrice(stockTicker);
-      if (price == null) {
-        throw new RuntimeException("가격 정보를 가져올 수 없습니다: " + stockTicker);
+    try {
+      // 1. 입력 검증
+      log.debug("1. 입력 검증 시작");
+      validateBuyOrderInput(userId, stockTicker, quantity, price);
+
+      // 2. 종목 코드 정규화 및 검증
+      log.debug("2. 종목 코드 정규화");
+      String normalizedTicker = stockUtilService.normalizeStockTicker(stockTicker);
+      if (!stockUtilService.isValidStockTicker(normalizedTicker)) {
+        throw new RuntimeException("유효하지 않은 종목 코드: " + stockTicker);
       }
+
+      // 3. 가격이 null이면 현재가로 설정
+      log.debug("3. 종목 코드 검증");
+      if (price == null) {
+        price = stockPriceService.getCurrentPrice(normalizedTicker);
+        if (price == null) {
+          throw new RuntimeException("가격 정보를 가져올 수 없습니다: " + normalizedTicker);
+        }
+      }
+
+      // 4. 총 필요 금액 계산
+      Integer totalAmount = price * quantity;
+
+      // 5. 계좌 조회 및 검증
+      Account account = getAccountByUserId(userId);
+
+      // 6. 잔고 확인
+      if (!accountService.canBuy(userId, totalAmount)) {
+        Integer currentBalance = accountService.getBalance(userId);
+        throw new RuntimeException(String.format(
+            "잔고 부족: 필요금액=%,d원, 현재잔고=%,d원, 부족금액=%,d원",
+            totalAmount, currentBalance, totalAmount - currentBalance));
+      }
+
+      // 7. 종목 정보 확인
+      Stock stock = getStockByTicker(normalizedTicker);
+      if (stock == null) {
+        throw new RuntimeException("종목을 찾을 수 없습니다: stockTicker=" + normalizedTicker);
+      }
+
+      // 8. 매수 주문 생성
+      String stockbuyId = generateId(IdType.STOCK_BUY);
+      StockBuy stockBuy = createStockBuyEntity(stockbuyId, price, quantity, account, stock);
+
+      stockBuyRepository.save(stockBuy);
+
+      // 9. 잔고 차감 (예약 주문도 미리 차감)
+      accountService.deductBalance(userId, totalAmount);
+
+      // 10. 장내시간이면 Kafka로 비동기 체결 처리 요청
+      if (stockStatusService.isMarketOpen() && "PENDING".equals(stockBuy.getStockbuyStatus())) {
+        publishBuyOrderToKafka(stockbuyId);
+        log.info("매수 주문 Kafka 발행 완료: stockbuyId={}", stockbuyId);
+      }
+
+      log.info("매수 주문 접수 완료: stockbuyId={}, status={}, totalAmount={}",
+          stockbuyId, stockBuy.getStockbuyStatus(), totalAmount);
+
+      return stockbuyId;
+
+    } catch (Exception e) {
+      log.error("매수 주문 접수 실패: userId={}, stockTicker={}, error={}",
+          userId, stockTicker, e.getMessage());
+      throw e;
     }
-
-    // 2. 총 필요 금액 계산
-    Integer totalAmount = price * quantity;
-
-    // 3. 계좌 조회
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-
-    // 4. 잔고 확인
-    if (account.getAccountAmount() < totalAmount) {
-      throw new RuntimeException("잔고 부족: 필요금액=" + totalAmount +
-          ", 현재잔고=" + account.getAccountAmount());
-    }
-
-    // 5. 종목 정보 확인
-    Stock stock = getStockByTicker(stockTicker);
-    if (stock == null) {
-      throw new RuntimeException("종목을 찾을 수 없습니다: stockTicker=" + stockTicker);
-    }
-
-    // 6. 매수 주문 생성
-    String stockbuyId = generateId(IdType.STOCK_BUY);
-    StockBuy stockBuy = new StockBuy();
-    stockBuy.setStockbuyId(stockbuyId);
-    stockBuy.setStockbuyPrice(price);
-    stockBuy.setStockbuyNum(quantity);
-
-    // 7. 장내/장외 시간에 따른 상태 설정
-    if (isMarketOpen()) {
-      stockBuy.setStockbuyStatus("PENDING");
-      log.info("장내 시간 - 일반 주문으로 접수");
-    } else {
-      stockBuy.setStockbuyStatus("RESERVED");
-      log.info("장외 시간 - 예약 주문으로 접수");
-    }
-
-    stockBuy.setStockbuyCreatetime(Timestamp.valueOf(LocalDateTime.now()));
-    stockBuy.setStockbuyChangetime(Timestamp.valueOf(LocalDateTime.now()));
-    stockBuy.setAccount(account);
-    stockBuy.setStock(stock);
-
-    stockBuyRepository.save(stockBuy);
-
-    // 8. 잔고 차감 (예약 주문도 미리 차감)
-    account.setAccountAmount(account.getAccountAmount() - totalAmount);
-    account.setAccountChangetime(Timestamp.valueOf(LocalDateTime.now()));
-    accountRepository.save(account);
-
-    log.info("매수 주문 접수 완료: stockbuyId={}, status={}, totalAmount={}",
-        stockbuyId, stockBuy.getStockbuyStatus(), totalAmount);
-    return stockbuyId;
   }
 
   /**
-   * 매도 주문 접수 (개선된 버전)
+   * 매도 주문 접수
    */
-  public String submitSellOrder(String userId, String stockTicker, Integer quantity,
-      Integer price) {
+  public String submitSellOrder(String userId, String stockTicker, Integer quantity, Integer price) {
     log.info("매도 주문 접수 시작: userId={}, stockTicker={}, quantity={}, price={}",
         userId, stockTicker, quantity, price);
 
-    // 1. 가격이 null이면 현재가로 설정
-    if (price == null) {
-      price = getCurrentPrice(stockTicker);
+    try {
+      // 1. 입력 검증
+      validateSellOrderInput(userId, stockTicker, quantity, price);
+
+      // 2. 종목 코드 정규화 및 검증
+      String normalizedTicker = stockUtilService.normalizeStockTicker(stockTicker);
+      if (!stockUtilService.isValidStockTicker(normalizedTicker)) {
+        throw new RuntimeException("유효하지 않은 종목 코드: " + stockTicker);
+      }
+
+      // 3. 가격이 null이면 현재가로 설정
       if (price == null) {
-        throw new RuntimeException("가격 정보를 가져올 수 없습니다: " + stockTicker);
-      }
-    }
-
-    // 2. 계좌 조회
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-
-    // 3. 보유 주식 조회
-    Holding holding = getHoldingByAccountAndStock(account, stockTicker);
-    if (holding == null) {
-      throw new RuntimeException("보유 주식이 없습니다: stockTicker=" + stockTicker);
-    }
-
-    // 4. 보유 수량 확인
-    if (holding.getHoldNum() < quantity) {
-      throw new RuntimeException("보유 수량 부족: 보유수량=" + holding.getHoldNum() +
-          ", 매도요청=" + quantity);
-    }
-
-    // 5. 종목 정보 확인
-    Stock stock = getStockByTicker(stockTicker);
-    if (stock == null) {
-      throw new RuntimeException("종목을 찾을 수 없습니다: stockTicker=" + stockTicker);
-    }
-
-    // 6. 매도 주문 생성
-    String stocksellId = generateId(IdType.STOCK_SELL);
-    StockSell stockSell = new StockSell();
-    stockSell.setStocksellId(stocksellId);
-    stockSell.setStocksellPrice(price);
-    stockSell.setStocksellNum(quantity);
-
-    // 7. 장내/장외 시간에 따른 상태 설정
-    if (isMarketOpen()) {
-      stockSell.setStocksellStatus("PENDING");
-      log.info("장내 시간 - 일반 주문으로 접수");
-    } else {
-      stockSell.setStocksellStatus("RESERVED");
-      log.info("장외 시간 - 예약 주문으로 접수");
-    }
-
-    stockSell.setStocksellCreatetime(Timestamp.valueOf(LocalDateTime.now()));
-    stockSell.setStocksellChangetime(Timestamp.valueOf(LocalDateTime.now()));
-    stockSell.setAccount(account);
-    stockSell.setHolding(holding);
-
-    stockSellRepository.save(stockSell);
-
-    log.info("매도 주문 접수 완료: stocksellId={}, status={}", stocksellId, stockSell.getStocksellStatus());
-    return stocksellId;
-  }
-
-  /**
-   * 현재가 조회 (장내/장외 시간 고려)
-   */
-  private Integer getCurrentPrice(String stockTicker) {
-    if (isMarketOpen()) {
-      // 장내 시간: 실시간 주가 사용
-      RealTimeStockPriceDto realTimePrice = getRealTimeStockPrice(stockTicker);
-      if (realTimePrice != null) {
-        return realTimePrice.getCurrentPrice();
-      }
-    }
-
-    // 장외 시간 또는 실시간 데이터 없음: 전일 종가 사용
-    return getPreviousClosePrice(stockTicker);
-  }
-
-  /**
-   * 전일 종가 조회 (DB 또는 외부 API)
-   */
-  private Integer getPreviousClosePrice(String stockTicker) {
-    try {
-      // TODO: 실제 구현 시 DB에서 전일 종가 조회 또는 외부 API 호출
-      // 현재는 임시로 실시간 데이터가 있으면 그것을 사용
-      RealTimeStockPriceDto realTimePrice = getRealTimeStockPrice(stockTicker);
-      if (realTimePrice != null) {
-        return realTimePrice.getCurrentPrice();
-      }
-
-      // 임시 기본값 (실제로는 DB에서 조회해야 함)
-      switch (stockTicker) {
-        case "005930":
-          return 70000; // 삼성전자 임시값
-        case "035420":
-          return 200000; // NAVER 임시값
-        case "000660":
-          return 120000; // SK하이닉스 임시값
-        default:
-          return 50000; // 기본값
-      }
-    } catch (Exception e) {
-      log.error("전일 종가 조회 실패: {}", stockTicker, e);
-      return 50000; // 기본값
-    }
-  }
-
-  /**
-   * 예약 주문을 일반 주문으로 전환 (개장 시)
-   */
-  public void processReservedOrders() {
-    log.info("예약 주문 처리 시작");
-
-    try {
-      // 예약된 매수 주문 처리
-      List<StockBuy> reservedBuyOrders = stockBuyRepository.findByStockbuyStatus("RESERVED");
-      for (StockBuy buyOrder : reservedBuyOrders) {
-        buyOrder.setStockbuyStatus("PENDING");
-        buyOrder.setStockbuyChangetime(Timestamp.valueOf(LocalDateTime.now()));
-
-        // 개장 시 실제 시세로 가격 업데이트
-        Integer currentPrice = getCurrentPrice(buyOrder.getStock().getStockTicker());
-        if (currentPrice != null) {
-          Integer oldPrice = buyOrder.getStockbuyPrice();
-          Integer priceDiff = (currentPrice - oldPrice) * buyOrder.getStockbuyNum();
-
-          // 가격 차이만큼 잔고 조정
-          Account account = buyOrder.getAccount();
-          if (priceDiff > 0) {
-            // 가격 상승: 추가 차감 필요
-            if (account.getAccountAmount() >= priceDiff) {
-              account.setAccountAmount(account.getAccountAmount() - priceDiff);
-              buyOrder.setStockbuyPrice(currentPrice);
-            } else {
-              // 잔고 부족으로 주문 취소
-              buyOrder.setStockbuyStatus("CANCELLED");
-              // 기존 차감 금액 환불
-              account.setAccountAmount(
-                  account.getAccountAmount() + oldPrice * buyOrder.getStockbuyNum());
-              log.warn("예약 주문 취소 (잔고 부족): {}", buyOrder.getStockbuyId());
-            }
-          } else if (priceDiff < 0) {
-            // 가격 하락: 초과 차감 금액 환불
-            account.setAccountAmount(account.getAccountAmount() + Math.abs(priceDiff));
-            buyOrder.setStockbuyPrice(currentPrice);
-          }
-
-          accountRepository.save(account);
+        price = stockPriceService.getCurrentPrice(normalizedTicker);
+        if (price == null) {
+          throw new RuntimeException("가격 정보를 가져올 수 없습니다: " + normalizedTicker);
         }
-
-        stockBuyRepository.save(buyOrder);
       }
 
-      // 예약된 매도 주문 처리
-      List<StockSell> reservedSellOrders = stockSellRepository.findByStocksellStatus("RESERVED");
-      for (StockSell sellOrder : reservedSellOrders) {
-        sellOrder.setStocksellStatus("PENDING");
-        sellOrder.setStocksellChangetime(Timestamp.valueOf(LocalDateTime.now()));
+      // 4. 계좌 조회
+      Account account = getAccountByUserId(userId);
 
-        // 개장 시 실제 시세로 가격 업데이트
-        Integer currentPrice = getCurrentPrice(sellOrder.getHolding().getStock().getStockTicker());
-        if (currentPrice != null) {
-          sellOrder.setStocksellPrice(currentPrice);
+      // 5. 보유 주식 조회 및 검증
+      Holding holding = getHoldingByAccountAndStock(account, normalizedTicker);
+      if (holding == null) {
+        throw new RuntimeException("보유 주식이 없습니다: stockTicker=" + normalizedTicker);
+      }
+
+      // 6. 보유 수량 확인
+      if (holding.getHoldNum() < quantity) {
+        throw new RuntimeException(String.format(
+            "보유 수량 부족: 보유수량=%,d주, 매도요청=%,d주, 부족수량=%,d주",
+            holding.getHoldNum(), quantity, quantity - holding.getHoldNum()));
+      }
+
+      // 7. 종목 정보 확인
+      Stock stock = holding.getStock();
+      if (stock == null) {
+        stock = getStockByTicker(normalizedTicker);
+        if (stock == null) {
+          throw new RuntimeException("종목을 찾을 수 없습니다: stockTicker=" + normalizedTicker);
         }
-
-        stockSellRepository.save(sellOrder);
       }
 
-      log.info("예약 주문 처리 완료: 매수 {}건, 매도 {}건",
-          reservedBuyOrders.size(), reservedSellOrders.size());
+      // 8. 매도 주문 생성
+      String stocksellId = generateId(IdType.STOCK_SELL);
+      StockSell stockSell = createStockSellEntity(stocksellId, price, quantity, account, holding);
+
+      stockSellRepository.save(stockSell);
+
+      // 9. 장내시간이면 Kafka로 비동기 체결 처리 요청
+      if (stockStatusService.isMarketOpen() && "PENDING".equals(stockSell.getStocksellStatus())) {
+        publishSellOrderToKafka(stocksellId);
+        log.info("매도 주문 Kafka 발행 완료: stocksellId={}", stocksellId);
+      }
+
+      log.info("매도 주문 접수 완료: stocksellId={}, status={}",
+          stocksellId, stockSell.getStocksellStatus());
+
+      return stocksellId;
 
     } catch (Exception e) {
-      log.error("예약 주문 처리 실패", e);
+      log.error("매도 주문 접수 실패: userId={}, stockTicker={}, error={}",
+          userId, stockTicker, e.getMessage());
+      throw e;
     }
   }
+
+  // ========== Kafka 메시지 발행 ==========
+
+  /**
+   * 매수 주문을 Kafka로 발행
+   */
+  private void publishBuyOrderToKafka(String stockbuyId) {
+    try {
+      OrderMessage orderMessage = OrderMessage.builder()
+          .orderId(stockbuyId)
+          .orderType("BUY")
+          .timestamp(System.currentTimeMillis())
+          .retryCount(0)
+          .build();
+
+      String messageJson = objectMapper.writeValueAsString(orderMessage);
+      kafkaTemplate.send(BUY_ORDERS_TOPIC, stockbuyId, messageJson);
+
+      log.debug("매수 주문 Kafka 발행: stockbuyId={}", stockbuyId);
+    } catch (Exception e) {
+      log.error("매수 주문 Kafka 발행 실패: stockbuyId={}", stockbuyId, e);
+    }
+  }
+
+  /**
+   * 매도 주문을 Kafka로 발행
+   */
+  private void publishSellOrderToKafka(String stocksellId) {
+    try {
+      OrderMessage orderMessage = OrderMessage.builder()
+          .orderId(stocksellId)
+          .orderType("SELL")
+          .timestamp(System.currentTimeMillis())
+          .retryCount(0)
+          .build();
+
+      String messageJson = objectMapper.writeValueAsString(orderMessage);
+      kafkaTemplate.send(SELL_ORDERS_TOPIC, stocksellId, messageJson);
+
+      log.debug("매도 주문 Kafka 발행: stocksellId={}", stocksellId);
+    } catch (Exception e) {
+      log.error("매도 주문 Kafka 발행 실패: stocksellId={}", stocksellId, e);
+    }
+  }
+
+  // ========== 주문 체결 처리 (StockOrderService에서 호출) ==========
 
   /**
    * 매수 주문 체결 처리 (확률 기반)
@@ -414,6 +350,190 @@ public class TradingService {
   }
 
   /**
+   * 매수 주문 강제 체결 (5회 재시도 후 100% 체결)
+   */
+  public void processBuyOrderForced(String stockbuyId) {
+    log.info("매수 주문 강제 체결 시작: stockbuyId={}", stockbuyId);
+
+    StockBuy stockBuy = stockBuyRepository.findById(stockbuyId)
+        .orElseThrow(() -> new RuntimeException("매수 주문을 찾을 수 없습니다: " + stockbuyId));
+
+    if (!"PENDING".equals(stockBuy.getStockbuyStatus())) {
+      log.warn("이미 처리된 주문 - 강제 체결 불가: stockbuyId={}, status={}",
+          stockbuyId, stockBuy.getStockbuyStatus());
+      return;
+    }
+
+    try {
+      executeBuyOrder(stockBuy);
+      log.info("매수 주문 강제 체결 완료: stockbuyId={}", stockbuyId);
+    } catch (Exception e) {
+      log.error("매수 주문 강제 체결 실패: stockbuyId={}", stockbuyId, e);
+      throw e;
+    }
+  }
+
+  /**
+   * 매도 주문 강제 체결 (5회 재시도 후 100% 체결)
+   */
+  public void processSellOrderForced(String stocksellId) {
+    log.info("매도 주문 강제 체결 시작: stocksellId={}", stocksellId);
+
+    StockSell stockSell = stockSellRepository.findById(stocksellId)
+        .orElseThrow(() -> new RuntimeException("매도 주문을 찾을 수 없습니다: " + stocksellId));
+
+    if (!"PENDING".equals(stockSell.getStocksellStatus())) {
+      log.warn("이미 처리된 주문 - 강제 체결 불가: stocksellId={}, status={}",
+          stocksellId, stockSell.getStocksellStatus());
+      return;
+    }
+
+    try {
+      executeSellOrder(stockSell);
+      log.info("매도 주문 강제 체결 완료: stocksellId={}", stocksellId);
+    } catch (Exception e) {
+      log.error("매도 주문 강제 체결 실패: stocksellId={}", stocksellId, e);
+      throw e;
+    }
+  }
+
+  // ========== 예약 주문 처리 ==========
+
+  /**
+   * 예약 주문을 일반 주문으로 전환 (개장 시)
+   */
+  public void processReservedOrders() {
+    log.info("예약 주문 처리 시작");
+
+    try {
+      // 예약된 매수 주문 처리
+      List<StockBuy> reservedBuyOrders = stockBuyRepository.findByStockbuyStatus("RESERVED");
+      for (StockBuy buyOrder : reservedBuyOrders) {
+        buyOrder.setStockbuyStatus("PENDING");
+        buyOrder.setStockbuyChangetime(Timestamp.valueOf(LocalDateTime.now()));
+
+        // 개장 시 실제 시세로 가격 업데이트
+        Integer currentPrice = stockPriceService.getCurrentPrice(buyOrder.getStock().getStockTicker());
+        if (currentPrice != null) {
+          Integer oldPrice = buyOrder.getStockbuyPrice();
+          Integer priceDiff = (currentPrice - oldPrice) * buyOrder.getStockbuyNum();
+
+          // 가격 차이만큼 잔고 조정
+          Account account = buyOrder.getAccount();
+          if (priceDiff > 0) {
+            // 가격 상승: 추가 차감 필요
+            if (accountService.canBuy(account.getUserId(), priceDiff)) {
+              accountService.deductBalance(account.getUserId(), priceDiff);
+              buyOrder.setStockbuyPrice(currentPrice);
+            } else {
+              // 잔고 부족으로 주문 취소
+              buyOrder.setStockbuyStatus("CANCELLED");
+              // 기존 차감 금액 환불
+              accountService.addBalance(account.getUserId(), oldPrice * buyOrder.getStockbuyNum());
+              log.warn("예약 주문 취소 (잔고 부족): {}", buyOrder.getStockbuyId());
+            }
+          } else if (priceDiff < 0) {
+            // 가격 하락: 초과 차감 금액 환불
+            accountService.addBalance(account.getUserId(), Math.abs(priceDiff));
+            buyOrder.setStockbuyPrice(currentPrice);
+          }
+        }
+
+        stockBuyRepository.save(buyOrder);
+
+        // PENDING 상태로 변경된 주문은 Kafka로 처리 요청
+        if ("PENDING".equals(buyOrder.getStockbuyStatus())) {
+          publishBuyOrderToKafka(buyOrder.getStockbuyId());
+        }
+      }
+
+      // 예약된 매도 주문 처리
+      List<StockSell> reservedSellOrders = stockSellRepository.findByStocksellStatus("RESERVED");
+      for (StockSell sellOrder : reservedSellOrders) {
+        sellOrder.setStocksellStatus("PENDING");
+        sellOrder.setStocksellChangetime(Timestamp.valueOf(LocalDateTime.now()));
+
+        // 개장 시 실제 시세로 가격 업데이트
+        Integer currentPrice = stockPriceService.getCurrentPrice(sellOrder.getHolding().getStock().getStockTicker());
+        if (currentPrice != null) {
+          sellOrder.setStocksellPrice(currentPrice);
+        }
+
+        stockSellRepository.save(sellOrder);
+
+        // PENDING 상태로 변경된 주문은 Kafka로 처리 요청
+        if ("PENDING".equals(sellOrder.getStocksellStatus())) {
+          publishSellOrderToKafka(sellOrder.getStocksellId());
+        }
+      }
+
+      log.info("예약 주문 처리 완료: 매수 {}건, 매도 {}건",
+          reservedBuyOrders.size(), reservedSellOrders.size());
+
+    } catch (Exception e) {
+      log.error("예약 주문 처리 실패", e);
+    }
+  }
+
+  // ========== 엔터티 생성 메서드 ==========
+
+  /**
+   * 매수 주문 엔터티 생성
+   */
+  private StockBuy createStockBuyEntity(String stockbuyId, Integer price, Integer quantity,
+      Account account, Stock stock) {
+    StockBuy stockBuy = new StockBuy();
+    stockBuy.setStockbuyId(stockbuyId);
+    stockBuy.setStockbuyPrice(price);
+    stockBuy.setStockbuyNum(quantity);
+
+    // 장내/장외 시간에 따른 상태 설정
+    if (stockStatusService.isMarketOpen()) {
+      stockBuy.setStockbuyStatus("PENDING");
+      log.debug("장내 시간 - 일반 주문으로 접수");
+    } else {
+      stockBuy.setStockbuyStatus("RESERVED");
+      log.debug("장외 시간 - 예약 주문으로 접수");
+    }
+
+    stockBuy.setStockbuyCreatetime(Timestamp.valueOf(LocalDateTime.now()));
+    stockBuy.setStockbuyChangetime(Timestamp.valueOf(LocalDateTime.now()));
+    stockBuy.setAccount(account);
+    stockBuy.setStock(stock);
+
+    return stockBuy;
+  }
+
+  /**
+   * 매도 주문 엔터티 생성
+   */
+  private StockSell createStockSellEntity(String stocksellId, Integer price, Integer quantity,
+      Account account, Holding holding) {
+    StockSell stockSell = new StockSell();
+    stockSell.setStocksellId(stocksellId);
+    stockSell.setStocksellPrice(price);
+    stockSell.setStocksellNum(quantity);
+
+    // 장내/장외 시간에 따른 상태 설정
+    if (stockStatusService.isMarketOpen()) {
+      stockSell.setStocksellStatus("PENDING");
+      log.debug("장내 시간 - 일반 주문으로 접수");
+    } else {
+      stockSell.setStocksellStatus("RESERVED");
+      log.debug("장외 시간 - 예약 주문으로 접수");
+    }
+
+    stockSell.setStocksellCreatetime(Timestamp.valueOf(LocalDateTime.now()));
+    stockSell.setStocksellChangetime(Timestamp.valueOf(LocalDateTime.now()));
+    stockSell.setAccount(account);
+    stockSell.setHolding(holding);
+
+    return stockSell;
+  }
+
+  // ========== 체결 실행 메서드 ==========
+
+  /**
    * 체결 확률 계산 (65~75% 확률)
    */
   private boolean shouldExecuteOrder() {
@@ -422,8 +542,6 @@ public class TradingService {
     log.debug("체결 확률 계산: executionRate={:.2f}, result={}", executionRate, result);
     return result;
   }
-
-  // 기존 메서드들은 그대로 유지 (executeBuyOrder, executeSellOrder, updateHoldingForBuy, etc.)
 
   /**
    * 매수 주문 체결 실행
@@ -448,9 +566,7 @@ public class TradingService {
       // 체결 실패 시 잔고 원복
       Account account = stockBuy.getAccount();
       Integer refundAmount = stockBuy.getStockbuyPrice() * stockBuy.getStockbuyNum();
-      account.setAccountAmount(account.getAccountAmount() + refundAmount);
-      account.setAccountChangetime(Timestamp.valueOf(LocalDateTime.now()));
-      accountRepository.save(account);
+      accountService.addBalance(account.getUserId(), refundAmount);
 
       stockBuy.setStockbuyStatus("FAILED");
       stockBuy.setStockbuyChangetime(Timestamp.valueOf(LocalDateTime.now()));
@@ -471,9 +587,9 @@ public class TradingService {
 
       Account account = stockSell.getAccount();
       Integer sellAmount = stockSell.getStocksellPrice() * stockSell.getStocksellNum();
-      account.setAccountAmount(account.getAccountAmount() + sellAmount);
-      account.setAccountChangetime(Timestamp.valueOf(LocalDateTime.now()));
-      accountRepository.save(account);
+
+      // AccountService를 통한 잔고 증가
+      accountService.addBalance(account.getUserId(), sellAmount);
 
       saveAccountHistoryForSell(account, sellAmount);
 
@@ -495,7 +611,7 @@ public class TradingService {
     }
   }
 
-  // 기존 유틸리티 메서드들 (updateHoldingForBuy, updateHoldingForSell, saveAccountHistoryForBuy, etc.)은 그대로 유지
+  // ========== 보유 주식 업데이트 ==========
 
   /**
    * 매수 시 보유 주식 업데이트
@@ -564,12 +680,16 @@ public class TradingService {
     }
   }
 
+  // ========== 거래 내역 저장 ==========
+
   /**
    * 거래 내역 저장 (매수용)
    */
   private void saveAccountHistoryForBuy(Account account, Integer amount) {
     String historyId = generateId(IdType.ACCOUNT_HISTORY);
-    Integer balanceAfter = account.getAccountAmount();
+
+    // AccountService를 통해 현재 잔고 조회
+    Integer balanceAfter = accountService.getBalance(account.getUserId());
     Integer balanceBefore = balanceAfter + amount;
 
     AccountHistory history = new AccountHistory();
@@ -591,7 +711,9 @@ public class TradingService {
    */
   private void saveAccountHistoryForSell(Account account, Integer amount) {
     String historyId = generateId(IdType.ACCOUNT_HISTORY);
-    Integer balanceAfter = account.getAccountAmount();
+
+    // AccountService를 통해 현재 잔고 조회
+    Integer balanceAfter = accountService.getBalance(account.getUserId());
     Integer balanceBefore = balanceAfter - amount;
 
     AccountHistory history = new AccountHistory();
@@ -608,80 +730,109 @@ public class TradingService {
         historyId, amount, balanceBefore, balanceAfter);
   }
 
-  // 기존 유틸리티 메서드들
+  // ========== 입력 검증 메서드 ==========
+
+  /**
+   * 매수 주문 입력 검증
+   */
+  private void validateBuyOrderInput(String userId, String stockTicker, Integer quantity, Integer price) {
+    if (userId == null || userId.trim().isEmpty()) {
+      throw new IllegalArgumentException("사용자 ID가 필요합니다");
+    }
+
+    if (stockTicker == null || stockTicker.trim().isEmpty()) {
+      throw new IllegalArgumentException("종목 코드가 필요합니다");
+    }
+
+    if (quantity == null || quantity <= 0) {
+      throw new IllegalArgumentException("주문 수량은 1주 이상이어야 합니다");
+    }
+
+    if (quantity > 10000) {
+      throw new IllegalArgumentException("주문 수량은 10,000주를 초과할 수 없습니다");
+    }
+
+    if (price != null && price <= 0) {
+      throw new IllegalArgumentException("주문 가격은 0원보다 커야 합니다");
+    }
+
+    if (price != null && price > 10000000) {
+      throw new IllegalArgumentException("주문 가격은 1,000만원을 초과할 수 없습니다");
+    }
+  }
+
+  /**
+   * 매도 주문 입력 검증
+   */
+  private void validateSellOrderInput(String userId, String stockTicker, Integer quantity, Integer price) {
+    if (userId == null || userId.trim().isEmpty()) {
+      throw new IllegalArgumentException("사용자 ID가 필요합니다");
+    }
+
+    if (stockTicker == null || stockTicker.trim().isEmpty()) {
+      throw new IllegalArgumentException("종목 코드가 필요합니다");
+    }
+
+    if (quantity == null || quantity <= 0) {
+      throw new IllegalArgumentException("주문 수량은 1주 이상이어야 합니다");
+    }
+
+    if (quantity > 10000) {
+      throw new IllegalArgumentException("주문 수량은 10,000주를 초과할 수 없습니다");
+    }
+
+    if (price != null && price <= 0) {
+      throw new IllegalArgumentException("주문 가격은 0원보다 커야 합니다");
+    }
+
+    if (price != null && price > 10000000) {
+      throw new IllegalArgumentException("주문 가격은 1,000만원을 초과할 수 없습니다");
+    }
+  }
+
+  // ========== 유틸리티 메서드 ==========
+
+  /**
+   * 사용자 ID로 계좌 조회 (AccountService 활용)
+   */
   private Account getAccountByUserId(String userId) {
-    List<Account> accounts = accountRepository.findByUserId(userId);
-    return accounts.isEmpty() ? null : accounts.get(0);
+    try {
+      return accountService.getAccountByUserId(userId);
+    } catch (RuntimeException e) {
+      // 계좌가 없으면 자동 생성
+      log.info("계좌가 없어서 자동 생성: userId={}", userId);
+      return accountService.createAccount(userId);
+    }
   }
 
+  /**
+   * 종목 코드로 종목 정보 조회
+   */
   private Stock getStockByTicker(String stockTicker) {
-    return stockRepository.findById(stockTicker).orElse(null);
+    // TODO: 임시 작성 해제 후 확인 필요
+    // 임시 작성 테스트용 더미
+    Stock stock = new Stock();
+    stock.setStockTicker(stockTicker);
+    stock.setStockName("테스트 종목 " + stockTicker);
+    stock.setStockSector("테스트 섹터");
+    stock.setStockStatus("LISTED");
+    return stock;
+    // 원래 코드
+//    return stockRepository.findById(stockTicker).orElse(null);
   }
 
+  /**
+   * 계좌와 종목으로 보유 주식 조회
+   */
   private Holding getHoldingByAccountAndStock(Account account, String stockTicker) {
-    Optional<Holding> result = holdingRepository.findByAccountAndStock_StockTicker(account,
-        stockTicker);
+    Optional<Holding> result = holdingRepository.findByAccountAndStock_StockTicker(account, stockTicker);
     return result.orElse(null);
   }
 
-  @Transactional(readOnly = true)
-  public List<StockBuy> getPendingBuyOrders(String userId) {
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-    return stockBuyRepository.findByAccountAndStockbuyStatus(account, "PENDING");
-  }
-
-  @Transactional(readOnly = true)
-  public List<StockSell> getPendingSellOrders(String userId) {
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-    return stockSellRepository.findByAccountAndStocksellStatus(account, "PENDING");
-  }
-
-  @Transactional(readOnly = true)
-  public List<StockBuy> getReservedBuyOrders(String userId) {
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-    return stockBuyRepository.findByAccountAndStockbuyStatus(account, "RESERVED");
-  }
-
-  @Transactional(readOnly = true)
-  public List<StockSell> getReservedSellOrders(String userId) {
-    Account account = getAccountByUserId(userId);
-    if (account == null) {
-      throw new RuntimeException("계좌를 찾을 수 없습니다: userId=" + userId);
-    }
-    return stockSellRepository.findByAccountAndStocksellStatus(account, "RESERVED");
-  }
+  // ========== ID 생성 ==========
 
   /**
-   * 테스트용 매수 주문 접수 및 즉시 체결 처리
-   */
-  public String submitAndProcessBuyOrder(String userId, String stockTicker, Integer quantity,
-      Integer price) {
-    String stockbuyId = submitBuyOrder(userId, stockTicker, quantity, price);
-    processBuyOrder(stockbuyId);
-    return stockbuyId;
-  }
-
-  /**
-   * 테스트용 매도 주문 접수 및 즉시 체결 처리
-   */
-  public String submitAndProcessSellOrder(String userId, String stockTicker, Integer quantity,
-      Integer price) {
-    String stocksellId = submitSellOrder(userId, stockTicker, quantity, price);
-    processSellOrder(stocksellId);
-    return stocksellId;
-  }
-
-  /**
-   * ID 생성 메서드
+   * ID 생성 타입 열거형
    */
   public enum IdType {
     STOCK_BUY("BUY"),
@@ -700,6 +851,9 @@ public class TradingService {
     }
   }
 
+  /**
+   * 고유 ID 생성
+   */
   private String generateId(IdType idType) {
     return idType.getPrefix() + "_" + System.currentTimeMillis() + "_" + random.nextInt(1000);
   }

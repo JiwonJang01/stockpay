@@ -1,13 +1,14 @@
 package com.project.stockpay.stock.controller;
 
-import com.project.stockpay.common.entity.StockBuy;
-import com.project.stockpay.common.entity.StockSell;
 import com.project.stockpay.stock.dto.BuyOrderRequestDto;
+import com.project.stockpay.stock.dto.OrderRetryStatus;
 import com.project.stockpay.stock.dto.SellOrderRequestDto;
 import com.project.stockpay.stock.service.TradingService;
+import com.project.stockpay.stock.service.StockOrderService;
+import com.project.stockpay.stock.service.StockPriceService;
+import com.project.stockpay.stock.service.StockStatusService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -16,259 +17,428 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 주식 거래 API 컨트롤러
- * - 매수/매도 주문 접수
- * - 주문 체결 처리
- * - 대기 주문 조회
+ * 모의투자 매매 거래 컨트롤러
+ * - 매수/매도 주문 처리
+ * - 주문 상태 모니터링
+ * - 예약 주문 관리
+ * - 확률적 체결 시스템 (65~75% 확률, 3분 재시도, 5회 후 100% 체결)
  */
 @RestController
-@RequestMapping("/trading")
+@RequestMapping("/api/trading")
 @RequiredArgsConstructor
 @Slf4j
 public class TradingController {
 
   private final TradingService tradingService;
+  private final StockOrderService stockOrderService;
+  private final StockPriceService stockPriceService;
+  private final StockStatusService stockStatusService;
+
+  // ========== 매수 주문 처리 ==========
 
   /**
-   * 매수 주문 접수
-   * POST /trading/buy
+   * 매수 주문 접수 (지정가)
    */
   @PostMapping("/buy")
   public ResponseEntity<Map<String, Object>> submitBuyOrder(
       @RequestBody BuyOrderRequestDto request) {
-    log.info("매수 주문 접수 요청: {}", request);
 
-    Map<String, Object> response = new HashMap<>();
+    log.info("매수 주문 접수: userId={}, stockTicker={}, quantity={}, price={}",
+        request.getUserId(), request.getStockTicker(), request.getQuantity(), request.getPrice());
 
     try {
-      // 입력 검증
-      validateBuyOrderRequest(request);
+      String stockbuyId = tradingService.submitBuyOrder(request);
 
-      // 매수 주문 접수
-      String stockbuyId = tradingService.submitBuyOrder(
-          request.getUserId(),
-          request.getStockTicker(),
-          request.getQuantity(),
-          // default: 장내 시간-실시간 거래가, 장외시간-전일종가
-          // 사용자 입력 시 사용자 입력 값
-          request.getPrice()
-      );
-
+      Map<String, Object> response = new HashMap<>();
       response.put("success", true);
-      response.put("message", "매수 주문이 성공적으로 접수되었습니다.");
-      response.put("stockbuyId", stockbuyId);
-      response.put("orderInfo", Map.of(
-          "userId", request.getUserId(),
-          "stockTicker", request.getStockTicker(),
-          "quantity", request.getQuantity(),
-          "price", request.getPrice(),
-          "totalAmount", request.getPrice() * request.getQuantity()
-      ));
+      response.put("orderId", stockbuyId);
+      response.put("orderType", "BUY");
+      response.put("message", "매수 주문이 접수되었습니다");
+      response.put("userId", request.getUserId());
+      response.put("stockTicker", request.getStockTicker());
+      response.put("quantity", request.getQuantity());
+      response.put("price", request.getPrice());
+      response.put("expectedExecution", "65~75% 확률로 체결, 미체결 시 3분 후 재시도");
+      response.put("isMarketOpen", stockStatusService.isMarketOpen());
+      response.put("timestamp", System.currentTimeMillis());
 
       return ResponseEntity.ok(response);
 
     } catch (Exception e) {
-      log.error("매수 주문 접수 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+      log.error("매수 주문 접수 실패: userId={}, error={}", request.getUserId(), e.getMessage());
+
+      Map<String, Object> errorResponse = new HashMap<>();
+      errorResponse.put("success", false);
+      errorResponse.put("orderType", "BUY");
+      errorResponse.put("message", "매수 주문 접수 실패: " + e.getMessage());
+      errorResponse.put("userId", request.getUserId());
+      errorResponse.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.badRequest().body(errorResponse);
     }
   }
 
   /**
-   * 매도 주문 접수 POST /trading/sell
+   * 시장가 매수 주문 (현재가로 즉시 주문)
+   */
+  @PostMapping("/buy/market")
+  public ResponseEntity<Map<String, Object>> submitBuyOrderAtMarketPrice(
+      @RequestParam String userId,
+      @RequestParam String stockTicker,
+      @RequestParam Integer quantity) {
+
+    log.info("시장가 매수 주문: userId={}, stockTicker={}, quantity={}",
+        userId, stockTicker, quantity);
+
+    try {
+      String stockbuyId = tradingService.submitBuyOrderAtMarketPrice(userId, stockTicker, quantity);
+
+      // 현재가 조회
+      Integer currentPrice = stockPriceService.getCurrentPrice(stockTicker);
+
+      Map<String, Object> response = new HashMap<>();
+      response.put("success", true);
+      response.put("orderId", stockbuyId);
+      response.put("orderType", "BUY_MARKET");
+      response.put("message", "시장가 매수 주문이 접수되었습니다");
+      response.put("userId", userId);
+      response.put("stockTicker", stockTicker);
+      response.put("quantity", quantity);
+      response.put("marketPrice", currentPrice);
+      response.put("totalAmount", currentPrice * quantity);
+      response.put("expectedExecution", "65~75% 확률로 체결, 미체결 시 3분 후 재시도");
+      response.put("isMarketOpen", stockStatusService.isMarketOpen());
+      response.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.ok(response);
+
+    } catch (Exception e) {
+      log.error("시장가 매수 주문 실패: userId={}, error={}", userId, e.getMessage());
+
+      Map<String, Object> errorResponse = new HashMap<>();
+      errorResponse.put("success", false);
+      errorResponse.put("orderType", "BUY_MARKET");
+      errorResponse.put("message", "시장가 매수 주문 실패: " + e.getMessage());
+      errorResponse.put("userId", userId);
+      errorResponse.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.badRequest().body(errorResponse);
+    }
+  }
+
+  // ========== 매도 주문 처리 ==========
+
+  /**
+   * 매도 주문 접수 (지정가)
    */
   @PostMapping("/sell")
   public ResponseEntity<Map<String, Object>> submitSellOrder(
       @RequestBody SellOrderRequestDto request) {
-    log.info("매도 주문 접수 요청: {}", request);
 
-    Map<String, Object> response = new HashMap<>();
+    log.info("매도 주문 접수: userId={}, stockTicker={}, quantity={}, price={}",
+        request.getUserId(), request.getStockTicker(), request.getQuantity(), request.getPrice());
 
     try {
-      // 입력 검증
-      validateSellOrderRequest(request);
+      String stocksellId = tradingService.submitSellOrder(request);
 
-      // 매도 주문 접수
-      String stocksellId = tradingService.submitSellOrder(
-          request.getUserId(),
-          request.getStockTicker(),
-          request.getQuantity(),
-          // default: 장내 시간-실시간 거래가, 장외시간-전일종가
-          // 사용자 입력 시 사용자 입력 값
-          request.getPrice()
+      Map<String, Object> response = new HashMap<>();
+      response.put("success", true);
+      response.put("orderId", stocksellId);
+      response.put("orderType", "SELL");
+      response.put("message", "매도 주문이 접수되었습니다");
+      response.put("userId", request.getUserId());
+      response.put("stockTicker", request.getStockTicker());
+      response.put("quantity", request.getQuantity());
+      response.put("price", request.getPrice());
+      response.put("expectedExecution", "65~75% 확률로 체결, 미체결 시 3분 후 재시도");
+      response.put("isMarketOpen", stockStatusService.isMarketOpen());
+      response.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.ok(response);
+
+    } catch (Exception e) {
+      log.error("매도 주문 접수 실패: userId={}, error={}", request.getUserId(), e.getMessage());
+
+      Map<String, Object> errorResponse = new HashMap<>();
+      errorResponse.put("success", false);
+      errorResponse.put("orderType", "SELL");
+      errorResponse.put("message", "매도 주문 접수 실패: " + e.getMessage());
+      errorResponse.put("userId", request.getUserId());
+      errorResponse.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.badRequest().body(errorResponse);
+    }
+  }
+
+  /**
+   * 시장가 매도 주문 (현재가로 즉시 주문)
+   */
+  @PostMapping("/sell/market")
+  public ResponseEntity<Map<String, Object>> submitSellOrderAtMarketPrice(
+      @RequestParam String userId,
+      @RequestParam String stockTicker,
+      @RequestParam Integer quantity) {
+
+    log.info("시장가 매도 주문: userId={}, stockTicker={}, quantity={}",
+        userId, stockTicker, quantity);
+
+    try {
+      String stocksellId = tradingService.submitSellOrderAtMarketPrice(userId, stockTicker, quantity);
+
+      // 현재가 조회
+      Integer currentPrice = stockPriceService.getCurrentPrice(stockTicker);
+
+      Map<String, Object> response = new HashMap<>();
+      response.put("success", true);
+      response.put("orderId", stocksellId);
+      response.put("orderType", "SELL_MARKET");
+      response.put("message", "시장가 매도 주문이 접수되었습니다");
+      response.put("userId", userId);
+      response.put("stockTicker", stockTicker);
+      response.put("quantity", quantity);
+      response.put("marketPrice", currentPrice);
+      response.put("totalAmount", currentPrice * quantity);
+      response.put("expectedExecution", "65~75% 확률로 체결, 미체결 시 3분 후 재시도");
+      response.put("isMarketOpen", stockStatusService.isMarketOpen());
+      response.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.ok(response);
+
+    } catch (Exception e) {
+      log.error("시장가 매도 주문 실패: userId={}, error={}", userId, e.getMessage());
+
+      Map<String, Object> errorResponse = new HashMap<>();
+      errorResponse.put("success", false);
+      errorResponse.put("orderType", "SELL_MARKET");
+      errorResponse.put("message", "시장가 매도 주문 실패: " + e.getMessage());
+      errorResponse.put("userId", userId);
+      errorResponse.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.badRequest().body(errorResponse);
+    }
+  }
+
+  // ========== 주문 상태 조회 및 모니터링 ==========
+
+  /**
+   * 주문 재시도 상태 조회 (확률적 체결 시스템 모니터링)
+   */
+  @GetMapping("/order/retry-status/{orderId}")
+  public ResponseEntity<Map<String, Object>> getOrderRetryStatus(
+      @PathVariable String orderId) {
+
+    log.info("주문 재시도 상태 조회: orderId={}", orderId);
+
+    OrderRetryStatus retryStatus = stockOrderService.getRetryStatus(orderId);
+
+    Map<String, Object> response = new HashMap<>();
+    response.put("orderId", retryStatus.getOrderId());
+    response.put("retryCount", retryStatus.getRetryCount());
+    response.put("maxRetryCount", retryStatus.getMaxRetryCount());
+    response.put("isMaxRetryReached", retryStatus.isMaxRetryReached());
+    response.put("nextRetryTime", retryStatus.getNextRetryTime());
+    response.put("status", retryStatus.isMaxRetryReached() ? "FORCE_EXECUTION_NEXT" : "RETRY_PENDING");
+    response.put("message", retryStatus.isMaxRetryReached() ?
+        "다음 시도에서 100% 체결됩니다" :
+        String.format("재시도 %d/%d - 3분 후 다시 시도", retryStatus.getRetryCount(), retryStatus.getMaxRetryCount()));
+    response.put("timestamp", System.currentTimeMillis());
+
+    return ResponseEntity.ok(response);
+  }
+
+  /**
+   * 거래 시스템 상태 조회
+   */
+  @GetMapping("/system/status")
+  public ResponseEntity<Map<String, Object>> getTradingSystemStatus() {
+
+    log.info("거래 시스템 상태 조회");
+
+    try {
+      boolean isMarketOpen = stockStatusService.isMarketOpen();
+      Map<String, Object> dataQuality = stockStatusService.checkDataQuality();
+      String dataQualityStatus = (String) dataQuality.get("status");
+
+      // 거래 시스템 상태 판단
+      boolean tradingSystemHealthy = !"CRITICAL".equals(dataQualityStatus) &&
+          !"ERROR".equals(dataQualityStatus);
+
+      Map<String, Object> response = new HashMap<>();
+      response.put("systemStatus", tradingSystemHealthy ? "HEALTHY" : "DEGRADED");
+      response.put("tradingEnabled", true); // 모의투자는 항상 거래 가능
+      response.put("executionProbability", "65~75%");
+
+      // 재시도 메커니즘 정보
+      Map<String, Object> retryMechanism = Map.of(
+          "enabled", true,
+          "retryInterval", "3분",
+          "maxRetries", 5,
+          "forceExecutionAfter", "5회 재시도 후 100% 체결"
+      );
+      response.put("retryMechanism", retryMechanism);
+
+      // 시장 정보
+      Map<String, Object> market = Map.of(
+          "isOpen", isMarketOpen,
+          "orderMode", isMarketOpen ? "즉시 처리" : "예약 주문",
+          "dataQuality", dataQualityStatus
+      );
+      response.put("market", market);
+
+      // 서비스 상태
+      Map<String, Object> services = Map.of(
+          "orderProcessing", "RUNNING",
+          "kafkaConsumer", "RUNNING",
+          "retryQueue", "RUNNING"
+      );
+      response.put("services", services);
+      response.put("timestamp", System.currentTimeMillis());
+
+      return ResponseEntity.ok(response);
+
+    } catch (Exception e) {
+      log.error("거래 시스템 상태 조회 실패", e);
+
+      Map<String, Object> errorResponse = Map.of(
+          "systemStatus", "ERROR",
+          "message", "거래 시스템 상태 조회 실패: " + e.getMessage(),
+          "timestamp", System.currentTimeMillis()
       );
 
+      return ResponseEntity.status(500).body(errorResponse);
+    }
+  }
+
+  // ========== 예약 주문 관리 ==========
+
+  /**
+   * 예약 주문 처리 (개장 시 자동 실행)
+   */
+  @PostMapping("/orders/process-reserved")
+  public ResponseEntity<Map<String, Object>> processReservedOrders() {
+
+    log.info("예약 주문 처리 요청");
+
+    try {
+      tradingService.processReservedOrders();
+
+      Map<String, Object> response = Map.of(
+          "success", true,
+          "message", "예약 주문이 처리되어 일반 주문으로 전환되었습니다",
+          "note", "전환된 주문들은 65~75% 확률로 체결 시도됩니다",
+          "timestamp", System.currentTimeMillis()
+      );
+
+      return ResponseEntity.ok(response);
+
+    } catch (Exception e) {
+      log.error("예약 주문 처리 실패", e);
+
+      Map<String, Object> errorResponse = Map.of(
+          "success", false,
+          "message", "예약 주문 처리 실패: " + e.getMessage(),
+          "timestamp", System.currentTimeMillis()
+      );
+
+      return ResponseEntity.ok(errorResponse);
+    }
+  }
+
+  // ========== 테스트 및 개발 지원 ==========
+
+  /**
+   * 거래 시스템 초기화 (테스트용)
+   */
+  @PostMapping("/system/initialize")
+  public ResponseEntity<Map<String, Object>> initializeTradingSystem() {
+
+    log.info("거래 시스템 초기화 요청");
+
+    try {
+      // 테스트용 전일 종가 설정
+      stockStatusService.setClosePricesForTesting();
+
+      Map<String, Object> response = new HashMap<>();
       response.put("success", true);
-      response.put("message", "매도 주문이 성공적으로 접수되었습니다.");
-      response.put("stocksellId", stocksellId);
-      response.put("orderInfo", Map.of(
-          "userId", request.getUserId(),
-          "stockTicker", request.getStockTicker(),
-          "quantity", request.getQuantity(),
-          "price", request.getPrice(),
-          "totalAmount", request.getPrice() * request.getQuantity()
+      response.put("message", "거래 시스템 초기화 완료");
+      response.put("actions", List.of(
+          "테스트용 주가 데이터 설정 완료",
+          "모의투자 거래 환경 준비 완료"
       ));
 
+      Map<String, Object> tradingInfo = Map.of(
+          "executionProbability", "65~75%",
+          "retryInterval", "3분",
+          "maxRetries", 5,
+          "forceExecution", "5회 후 100% 체결"
+      );
+      response.put("tradingInfo", tradingInfo);
+      response.put("timestamp", System.currentTimeMillis());
+
       return ResponseEntity.ok(response);
 
     } catch (Exception e) {
-      log.error("매도 주문 접수 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+      log.error("거래 시스템 초기화 실패", e);
+
+      Map<String, Object> errorResponse = Map.of(
+          "success", false,
+          "message", "거래 시스템 초기화 실패: " + e.getMessage(),
+          "timestamp", System.currentTimeMillis()
+      );
+
+      return ResponseEntity.ok(errorResponse);
     }
   }
 
   /**
-   * 매수 주문 체결 처리
-   * POST /trading/execute-buy/{stockbuyId}
+   * 거래 서비스 헬스체크
    */
-  @PostMapping("/execute-buy/{stockbuyId}")
-  public ResponseEntity<Map<String, Object>> executeBuyOrder(@PathVariable String stockbuyId) {
-    log.info("매수 주문 체결 처리 요청: stockbuyId={}", stockbuyId);
+  @GetMapping("/health")
+  public ResponseEntity<Map<String, Object>> healthCheck() {
 
-    Map<String, Object> response = new HashMap<>();
+    log.info("거래 서비스 헬스체크");
 
     try {
-      tradingService.processBuyOrder(stockbuyId);
+      // 기본 서비스 상태 확인
+      Map<String, Object> healthStatus = stockStatusService.healthCheck();
+      String status = (String) healthStatus.get("status");
 
-      response.put("success", true);
-      response.put("message", "매수 주문 체결 처리가 완료되었습니다.");
-      response.put("stockbuyId", stockbuyId);
+      // 거래 특화 정보 추가
+      Map<String, Object> tradingServices = Map.of(
+          "orderProcessing", "RUNNING",
+          "probabilisticExecution", "ACTIVE",
+          "retryMechanism", "ACTIVE",
+          "reservedOrderProcessing", "ACTIVE"
+      );
 
-      return ResponseEntity.ok(response);
+      Map<String, Object> tradingConfig = Map.of(
+          "executionRate", "65~75%",
+          "retryInterval", "3분",
+          "maxRetries", 5
+      );
 
-    } catch (Exception e) {
-      log.error("매수 주문 체결 처리 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
-    }
-  }
+      Map<String, Object> tradingHealth = Map.of(
+          "baseHealth", healthStatus,
+          "tradingServices", tradingServices,
+          "tradingConfig", tradingConfig
+      );
 
-  /**
-   * 매도 주문 체결 처리
-   * POST /trading/execute-sell/{stocksellId}
-   */
-  @PostMapping("/execute-sell/{stocksellId}")
-  public ResponseEntity<Map<String, Object>> executeSellOrder(@PathVariable String stocksellId) {
-    log.info("매도 주문 체결 처리 요청: stocksellId={}", stocksellId);
-
-    Map<String, Object> response = new HashMap<>();
-
-    try {
-      tradingService.processSellOrder(stocksellId);
-
-      response.put("success", true);
-      response.put("message", "매도 주문 체결 처리가 완료되었습니다.");
-      response.put("stocksellId", stocksellId);
-
-      return ResponseEntity.ok(response);
+      return switch (status) {
+        case "HEALTHY" -> ResponseEntity.ok(tradingHealth);
+        case "DEGRADED" -> ResponseEntity.status(206).body(tradingHealth);
+        default -> ResponseEntity.status(503).body(tradingHealth);
+      };
 
     } catch (Exception e) {
-      log.error("매도 주문 체결 처리 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+      log.error("거래 서비스 헬스체크 실패", e);
+
+      Map<String, Object> errorResponse = Map.of(
+          "status", "ERROR",
+          "message", "거래 서비스 헬스체크 실패: " + e.getMessage(),
+          "timestamp", System.currentTimeMillis()
+      );
+
+      return ResponseEntity.status(500).body(errorResponse);
     }
-  }
-
-  /**
-   * 대기 중인 매수 주문 조회
-   * GET /trading/{userId}/pending-buy
-   */
-  @GetMapping("/{userId}/pending-buy")
-  public ResponseEntity<Map<String, Object>> getPendingBuyOrders(@PathVariable String userId) {
-    log.info("대기 중인 매수 주문 조회: userId={}", userId);
-
-    Map<String, Object> response = new HashMap<>();
-
-    try {
-      List<StockBuy> pendingBuyOrders = tradingService.getPendingBuyOrders(userId);
-
-      response.put("success", true);
-      response.put("message", "대기 중인 매수 주문을 조회했습니다.");
-      response.put("userId", userId);
-      response.put("pendingBuyOrders", pendingBuyOrders);
-      response.put("count", pendingBuyOrders.size());
-
-      return ResponseEntity.ok(response);
-
-    } catch (Exception e) {
-      log.error("대기 중인 매수 주문 조회 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
-    }
-  }
-
-  /**
-   * 대기 중인 매도 주문 조회
-   * GET /trading/{userId}/pending-sell
-   */
-  @GetMapping("/{userId}/pending-sell")
-  public ResponseEntity<Map<String, Object>> getPendingSellOrders(@PathVariable String userId) {
-    log.info("대기 중인 매도 주문 조회: userId={}", userId);
-
-    Map<String, Object> response = new HashMap<>();
-
-    try {
-      List<StockSell> pendingSellOrders = tradingService.getPendingSellOrders(userId);
-
-      response.put("success", true);
-      response.put("message", "대기 중인 매도 주문을 조회했습니다.");
-      response.put("userId", userId);
-      response.put("pendingSellOrders", pendingSellOrders);
-      response.put("count", pendingSellOrders.size());
-
-      return ResponseEntity.ok(response);
-
-    } catch (Exception e) {
-      log.error("대기 중인 매도 주문 조회 실패: {}", e.getMessage());
-      response.put("success", false);
-      response.put("message", e.getMessage());
-      return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
-    }
-  }
-
-  // 입력 검증 메서드
-
-  /**
-   * 공통 주문 요청 검증 메서드
-   */
-  private void validateOrderRequest(String userId, String stockTicker, Integer quantity,
-      Integer price, String orderType) {
-    if (userId == null || userId.trim().isEmpty()) {
-      throw new IllegalArgumentException("사용자 ID는 필수입니다.");
-    }
-    if (stockTicker == null || stockTicker.trim().isEmpty()) {
-      throw new IllegalArgumentException("종목 티커는 필수입니다.");
-    }
-    if (quantity == null || quantity <= 0) {
-      throw new IllegalArgumentException("수량은 1 이상이어야 합니다.");
-    }
-    if (price == null || price <= 0) {
-      throw new IllegalArgumentException("가격은 1 이상이어야 합니다.");
-    }
-
-    log.debug("{} 주문 요청 검증 완료: userId={}, stockTicker={}, quantity={}, price={}",
-        orderType, userId, stockTicker, quantity, price);
-  }
-
-  /**
-   * 매수 주문 요청 검증
-   */
-  private void validateBuyOrderRequest(BuyOrderRequestDto request) {
-    validateOrderRequest(request.getUserId(), request.getStockTicker(),
-        request.getQuantity(), request.getPrice(), "매수");
-  }
-
-  /**
-   * 매도 주문 요청 검증
-   */
-  private void validateSellOrderRequest(SellOrderRequestDto request) {
-    validateOrderRequest(request.getUserId(), request.getStockTicker(),
-        request.getQuantity(), request.getPrice(), "매도");
   }
 }

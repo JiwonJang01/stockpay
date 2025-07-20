@@ -6,7 +6,7 @@ import org.springframework.stereotype.Repository;
 import java.util.List;
 
 @Repository
-public interface BagRepository extends JpaRepository<Cart, String> {
+public interface CartRepository extends JpaRepository<Cart, String> {
     // 사용자별 장바구니 조회
     List<Cart> findByUser_UserId(String userId);
     // 상품별 장바구니 조회
