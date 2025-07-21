@@ -9,7 +9,7 @@ import java.sql.*;
 @Getter
 @Setter
 @Builder
-// @Table(name = "user")
+ @Table(name = "users")
 public class User {
     // 고객 아이디 user_id
     @Id
