@@ -21,7 +21,7 @@ import java.util.Map;
  * - 시장 상태 정보
  */
 @RestController
-@RequestMapping("/api/stock")
+@RequestMapping("/stock")
 @RequiredArgsConstructor
 @Slf4j
 public class StockController {

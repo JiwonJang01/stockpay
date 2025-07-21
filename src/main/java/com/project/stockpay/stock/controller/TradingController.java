@@ -24,7 +24,7 @@ import java.util.Map;
  * - 확률적 체결 시스템 (65~75% 확률, 3분 재시도, 5회 후 100% 체결)
  */
 @RestController
-@RequestMapping("/api/trading")
+@RequestMapping("/trading")
 @RequiredArgsConstructor
 @Slf4j
 public class TradingController {

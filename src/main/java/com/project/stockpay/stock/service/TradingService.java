@@ -29,7 +29,6 @@ import java.util.Random;
  */
 @Service
 @RequiredArgsConstructor
-@Transactional
 @Slf4j
 public class TradingService {
 

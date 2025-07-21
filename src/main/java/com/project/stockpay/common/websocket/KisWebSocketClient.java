@@ -566,7 +566,7 @@ public class KisWebSocketClient {
         // 실시간 주가 데이터 DTO 생성
         RealTimeStockPriceDto priceData = RealTimeStockPriceDto.builder()
             .stockCode(stockCode)
-            .tradeTime(LocalDateTime.parse(tradeTime))
+            .tradeTime(parseTradeTime(tradeTime))
             .currentPrice(Integer.parseInt(currentPrice))
             .changeSign(changeSign)
             .changeAmount(Integer.parseInt(changeAmount))
