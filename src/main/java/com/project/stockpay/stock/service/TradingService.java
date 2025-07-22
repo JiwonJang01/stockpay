@@ -59,6 +59,8 @@ public class TradingService {
   @Value("${stockpay.kafka.topics.sell-orders:sell-orders}")
   private String SELL_ORDERS_TOPIC;
 
+  // TODO: Builder 적용필요
+
   // ========== 주문 접수 메서드 ==========
 
   /**

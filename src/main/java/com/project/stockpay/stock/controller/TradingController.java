@@ -34,6 +34,7 @@ public class TradingController {
   private final StockPriceService stockPriceService;
   private final StockStatusService stockStatusService;
 
+  // TODO: Map<String, Object> 형식 수정
   // ========== 매수 주문 처리 ==========
 
   /**
