@@ -60,6 +60,35 @@
 - 주식 기반 결제도 장외 시간에 가능하며, 개장 후 실제 매도 체결 시 결제가 확정된다.
 </br>
 
+## API 테스트
+```declarative
+#### WebSocketTestController 테스트
+curl http://localhost:8085/test/websocket/status          # 웹소켓 연결 상태
+curl http://localhost:8085/test/websocket/cache-status    # Redis 캐시 상태
+curl http://localhost:8085/test/websocket/message-stats   # 메시지 통계
+
+#### AcountController 테스트
+curl -X POST http://localhost:8085/test/account/create/testUser   # 계좌 생성
+curl http://localhost:8085/test/account/testUser                  # 계좌 조회
+curl http://localhost/test/account/testUser/balance          # 잔고 조회
+curl -X POST "http://localhost:8085/test/account/testUser/balance?amount=-10000"  # 출금 테스트
+
+#### TradingController 테스트
+# 매매주문
+curl -X POST http://localhost:8085/trading/buy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "testUser",
+    "stockTicker": "005930",
+    "quantity": 5,
+    "price": 70000
+  }'
+  
+#### StockController 테스트
+curl -X GET http://localhost:8085/stock/market/status
+
+
+```
 ## ERD
 ![](https://velog.velcdn.com/images/jiw0707/post/2aeff770-3dae-45ea-aac5-18619e16139c/image.png)
 
