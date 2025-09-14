@@ -66,7 +66,7 @@
 - 주식 기반 결제도 장외 시간에 가능하며, 개장 후 실제 매도 체결 시 결제가 확정된다. -->
 </br>
 
-## API 테스트
+## 테스트 진행
 ```declarative
 #### WebSocketTestController 테스트
 curl http://localhost:8085/test/websocket/status          # 웹소켓 연결 상태
